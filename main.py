@@ -1,17 +1,21 @@
 ﻿"""
-Orbit Wars - Tier 2 Efficient Expansion Agent  (v10)
+Orbit Wars - Tier 2 Efficient Expansion Agent  (v11)
 
 Strategy: aggressive expansion with chip attacks, focus-fire weakest enemy,
 eliminate players early in 4-player games. Dominant-mode all-in when clearly winning.
+Prefer frontier enemy planets (isolated, defensible) over deep-cluster targets.
 
 Key design decisions:
-  1. [v10] Opportunist scoring: dogpile_bonus 1.8→2.5x; added snipe_bonus (2x) when
+  1. [v11] retake_penalty: penalize enemy targets surrounded by same-owner enemy
+     planets (min_same_enemy_dist / 30, clamped 0.4-1.0). Prevents battle cycling —
+     capturing islands deep in enemy territory that get immediately retaken.
+  2. [v10] Opportunist scoring: dogpile_bonus 1.8→2.5x; added snipe_bonus (2x) when
      enemy garrison < 50% of third-party fleet en route — pile on for free captures.
-  2. [v10] zero-neutral aggression: enemy_bonus 5x when neutrals_left==0 (was 3x).
-  3. [v10] prod_bonus when losing_prod: 1.6→2.0x — more urgency to flip enemy prod.
-  4. [v10] elimination_mode ship cap raised 200→300 — start eliminating earlier.
-  5. [v10] clock pressure: turn>400 drops reserve an additional 30% — end-game all-in.
-  6. [v9] dominant_mode: when we lead by ≥3x ships AND ≥1.2x production vs weakest
+  3. [v10] zero-neutral aggression: enemy_bonus 5x when neutrals_left==0 (was 3x).
+  4. [v10] prod_bonus when losing_prod: 1.6→2.0x — more urgency to flip enemy prod.
+  5. [v10] elimination_mode ship cap raised 200→300 — start eliminating earlier.
+  6. [v10] clock pressure: turn>400 drops reserve an additional 30% — end-game all-in.
+  7. [v9] dominant_mode: when we lead by ≥3x ships AND ≥1.2x production vs weakest
      enemy, drop reserve to ~3% and apply 5x elim_bonus — close out the game fast.
      Safely bridges the gap between normal play and full elimination_mode.
   7. [v9] elim_bonus tiers: dominant_mode → 5x, elimination_mode → 3x, else 1x.
@@ -293,8 +297,20 @@ def _decide(obs):
             dogpile_bonus = 2.5 if third_ships > 0 else 1.0
             snipe_bonus   = 2.0 if (third_ships > 0 and t.owner not in (-1, player)
                                     and third_ships > t.ships * 0.5) else 1.0
+            # [v11] retake penalty: how quickly can same-enemy planets reinforce this target?
+            # High-risk targets (surrounded by same-enemy planets) get penalized
+            retake_penalty = 1.0
+            if t.owner not in (-1, player):
+                min_same_enemy_dist = min(
+                    (math.hypot(ep.x - t.x, ep.y - t.y)
+                     for ep in enemy_planets if ep.id != t.id and ep.owner == t.owner),
+                    default=100.0
+                )
+                # Penalty scales: 1.0 (safe, far) to 0.4 (risky, close cluster)
+                retake_penalty = max(0.4, min(1.0, min_same_enemy_dist / 30))
             score = (static_bonus * neutral_bonus * comet_bonus * enemy_bonus
                      * prod_bonus * elim_bonus * weak_bonus * dogpile_bonus * snipe_bonus
+                     * retake_penalty
                      * (t.production ** 1.3) / (dist * max(net_garr, 1.0)))
             candidates.append((score, mine.id, t.id, eta, tx, ty, net_garr))
 
