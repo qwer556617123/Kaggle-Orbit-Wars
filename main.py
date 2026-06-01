@@ -1,53 +1,32 @@
 ﻿"""
-Orbit Wars - Tier 2 Efficient Expansion Agent  (v11)
+Orbit Wars - Tier 2 Efficient Expansion Agent  (v12)
 
-Strategy: aggressive expansion with chip attacks, focus-fire weakest enemy,
+Strategy: aggressive expansion with chip attacks, focus-fire weakest/nearest enemy,
 eliminate players early in 4-player games. Dominant-mode all-in when clearly winning.
 Prefer frontier enemy planets (isolated, defensible) over deep-cluster targets.
 
 Key design decisions:
-  1. [v11] retake_penalty: penalize enemy targets surrounded by same-owner enemy
-     planets (min_same_enemy_dist / 30, clamped 0.4-1.0). Prevents battle cycling —
-     capturing islands deep in enemy territory that get immediately retaken.
-  2. [v11] neutral-first early game: when neutrals_left ≥ 6, enemy_bonus = 1.5
-     (equals neutral_bonus). Prioritize expansion over enemy attacks when neutrals
-     are plentiful — frees early ships for cheaper captures, better snowball.
-  3. [v10] Opportunist scoring: dogpile_bonus 1.8→2.5x; added snipe_bonus (2x) when
-     enemy garrison < 50% of third-party fleet en route — pile on for free captures.
-  4. [v10] zero-neutral aggression: enemy_bonus 5x when neutrals_left==0 (was 3x).
-  5. [v10] prod_bonus when losing_prod: 1.6→2.0x — more urgency to flip enemy prod.
-  5. [v10] elimination_mode ship cap raised 200→300 — start eliminating earlier.
-  6. [v10] clock pressure: turn>400 drops reserve an additional 30% — end-game all-in.
-  7. [v9] dominant_mode: when we lead by ≥3x ships AND ≥1.2x production vs weakest
-     enemy, drop reserve to ~3% and apply 5x elim_bonus — close out the game fast.
-     Safely bridges the gap between normal play and full elimination_mode.
-  7. [v9] elim_bonus tiers: dominant_mode → 5x, elimination_mode → 3x, else 1x.
-     Strongly funnels ships to finish off weakest enemy once we're dominant.
-  8. [v9] Phase 1 defense lock uses reserve_div=3 for both elimination/dominant_mode.
-  9. [v9] Phase 3 dispatch guard includes dominant_mode: partial attack allowed when
-     dominant. Threshold lowered to max(10, garrison*0.40) from 0.45.
- 10. [v9] Late-game reserve reduced: 22% (turns 150-350), 28% (350+) — frees ships
-     for offense in the endgame when we should be closing out. (Mid-game 0-150 kept
-     at v8's 18% after testing showed 12% hurt more than it helped.)
- 11. [v8] Phase 4 chip attacks: single-source per neutral — chip down high-garrison
-     neutrals we can't yet capture (neutrals don't regenerate, chips stack). Only
-     ONE source planet per neutral per turn to avoid wasted multi-chip overlap.
- 12. [v8] Raised elimination_mode cap (now 300) ships.
- 13. [v7] 4-player metric fixes: compare against max SINGLE enemy (not combined).
- 14. Multiple source planets can target the same neutral cooperatively.
- 15. Orbit-aware fleet detection: predict planet positions at fleet ETA to correctly
-     identify incoming threat targets for both orbiting and static planets.
- 16. Multi-ally reinforcement in Phase 1: cover incoming fleet threats with
-     combined fleets from multiple nearby planets.
- 17. [v3] 4-player: proper third-party dogpile detection.
- 18. [v4] Elimination mode: when weakest enemy total ships < 40% of ours,
-     set 1/3-reserve and give their planets 3x bonus - flood them.
- 19. [v4] Comet awareness: treat comets as high-value neutral targets (2x bonus).
- 20. [v5] Production scoring: prod^1.3 to strongly bias toward high-value planets.
- 21. [v3] 1.4x weak_bonus for weakest enemy.
- 22. [v6] Multi-fleet dispatch: env processes ALL moves per planet per turn (confirmed
-     from env source). Neutrals: unlimited multi-dispatch. Enemies: one attack per
-     planet per turn (prevents post-neutral ship bleed).
+  1. [v12] 4-player focus-fire: always concentrate ALL force on the NEAREST enemy
+     (min-dist from any of our planets to any of their planets). That enemy gets 4x
+     bonus; all other enemies get 0.5x penalty. Prevents the fatal scatter pattern
+     where we split attacks across 3 enemies and let P1 snowball unchecked.
+  2. [v12] Lower elimination_mode threshold 40%→50%, cap 300→400 ships. Triggers
+     focus-fire flood earlier, before the weakest enemy can recover production.
+  3. [v12] Lower stop_leader_bonus threshold 1.5x→1.2x — respond sooner when any
+     enemy outproduces us.
+  4. [v12] 4-player early-game reserve reduction: when four_player and turn < 60,
+     use 1/3 reserve (same as elimination_mode) to maximise expansion speed and
+     match the starter agent's 0%-reserve aggressive early expansion.
+  5. [v11] retake_penalty: penalize enemy targets surrounded by same-owner enemy
+     planets (min_same_enemy_dist / 30, clamped 0.4-1.0). Prevents battle cycling.
+  6. [v11] neutral-first early game: when neutrals_left ≥ 6, enemy_bonus = 1.5.
+  7. [v10] Opportunist scoring: dogpile_bonus 2.5x; snipe_bonus 2x.
+  8. [v10] zero-neutral aggression: enemy_bonus 5x when neutrals_left==0.
+  9. [v9] dominant_mode: ≥3x ships AND ≥1.2x prod → 1/3-reserve + 5x elim_bonus.
+ 10. [v8] Phase 4 chip attacks on neutrals we can't yet capture.
+ 11. [v7] 4-player metrics: compare against max SINGLE enemy (not combined).
+ 12. [v4] Elimination mode flood + comet awareness.
+ 13. [v5] Production scoring: prod^1.3.
 
 Public API
 ----------
@@ -215,7 +194,7 @@ def _decide(obs):
 
     my_total = sum(p.ships for p in my_planets)
     weakest_ships = enemy_strength.get(weakest_enemy, 9999) if weakest_enemy else 9999
-    elimination_mode = (weakest_ships < my_total * 0.40 and weakest_ships < 300)  # [v10] cap 200→300
+    elimination_mode = (weakest_ships < my_total * 0.50 and weakest_ships < 400)  # [v12] 40%→50%, cap 300→400
 
     # dominant_mode: we're clearly winning → go all-in to close the game
     dominant_mode = (
@@ -224,6 +203,28 @@ def _decide(obs):
         and my_prod >= max_enemy_prod * 1.2
         and not elimination_mode  # don't double-apply
     )
+
+    # [v11] production_leader: in 4-player, identify and pressure the biggest producer
+    enemy_prod_by_pid = {e: sum(p.production for p in enemy_planets if p.owner == e)
+                         for e in enemy_pids}
+    production_leader = max(enemy_prod_by_pid, key=enemy_prod_by_pid.get) if enemy_prod_by_pid else None
+    prod_leader_prod  = enemy_prod_by_pid.get(production_leader, 0)
+    # Threat = leader outproducing us by 20%+ in a multi-enemy game  [v12] 1.5→1.2
+    leader_is_threat  = len(enemy_pids) > 1 and prod_leader_prod > my_prod * 1.2
+
+    # [v12] 4-player focus-fire: always concentrate on the NEAREST enemy.
+    # Nearest = min distance from any of our planets to any of that enemy's planets.
+    # That enemy gets 4x attack bonus; all others get 0.5x penalty to avoid scatter.
+    four_player = len(enemy_pids) >= 2
+    focused_enemy_4p = None
+    if four_player and enemy_pids:
+        def _nearest_dist(ep_owner):
+            eps = [p for p in enemy_planets if p.owner == ep_owner]
+            if not eps or not my_planets:
+                return float('inf')
+            return min(math.hypot(ep.x - mp.x, ep.y - mp.y)
+                       for ep in eps for mp in my_planets)
+        focused_enemy_4p = min(enemy_pids, key=_nearest_dist)
 
     friendly_en, hostile_en, third_party_en = _parse_fleets(fleets, player, pid_map, ang_vel)
 
@@ -256,14 +257,17 @@ def _decide(obs):
             moves.append([ally.id, angle, contrib])
             source_used.add(ally.id)
             shortfall -= contrib
+        # [v11] Lock the defended planet too — prevent Phase 3 from depleting it
+        if shortfall < int(threat - defense) + 2:  # at least some help was sent
+            source_used.add(mine.id)
 
     # Phase 2: Score all (source, target) pairs
     candidates = []
     for mine in my_planets:
         if mine.id in source_used:
             continue
-        if elimination_mode or dominant_mode:
-            base_res = _reserve(mine.ships, _turn) // 3
+        if (elimination_mode or dominant_mode) or (four_player and _turn < 60):
+            base_res = _reserve(mine.ships, _turn) // 3  # [v12] 4p early-game: match starter 0%-reserve
         elif behind_on_planets:
             base_res = _reserve(mine.ships, _turn) // 2
         else:
@@ -321,17 +325,31 @@ def _decide(obs):
                 )
                 # Penalty scales: 1.0 (safe, far) to 0.4 (risky, close cluster)
                 retake_penalty = max(0.4, min(1.0, min_same_enemy_dist / 30))
+            # [v11] stop_leader_bonus: in 4-player, pressure the production leader
+            stop_leader_bonus = (2.0 if (leader_is_threat and t.owner == production_leader
+                                         and not elimination_mode and not dominant_mode)
+                                 else 1.0)
+            # [v12] 4-player focus-fire: 4x on nearest enemy, 0.5x on all others
+            if four_player and focused_enemy_4p is not None:
+                if t.owner == focused_enemy_4p:
+                    focus_4p = 4.0
+                elif t.owner not in (-1, player):
+                    focus_4p = 0.5   # penalise non-focus enemies to avoid scatter
+                else:
+                    focus_4p = 1.0
+            else:
+                focus_4p = 1.0
             score = (static_bonus * neutral_bonus * comet_bonus * enemy_bonus
                      * prod_bonus * elim_bonus * weak_bonus * dogpile_bonus * snipe_bonus
-                     * retake_penalty
+                     * retake_penalty * stop_leader_bonus * focus_4p
                      * (t.production ** 1.3) / (dist * max(net_garr, 1.0)))
             candidates.append((score, mine.id, t.id, eta, tx, ty, net_garr, retake_penalty))
 
     candidates.sort(key=lambda c: c[0], reverse=True)
 
-    if elimination_mode or dominant_mode:
+    if (elimination_mode or dominant_mode) or (four_player and _turn < 60):
         mine_avail = {p.id: max(0, p.ships - _reserve(p.ships, _turn) // 3)
-                      for p in my_planets if p.id not in source_used}
+                      for p in my_planets if p.id not in source_used}  # [v12] 4p early: min reserve
     elif behind_on_planets:
         mine_avail = {p.id: max(0, p.ships - _reserve(p.ships, _turn) // 2)
                       for p in my_planets if p.id not in source_used}
