@@ -1,42 +1,44 @@
 ﻿"""
-Orbit Wars - Tier 2 Efficient Expansion Agent  (v9)
+Orbit Wars - Tier 2 Efficient Expansion Agent  (v10)
 
 Strategy: aggressive expansion with chip attacks, focus-fire weakest enemy,
 eliminate players early in 4-player games. Dominant-mode all-in when clearly winning.
 
 Key design decisions:
-  1. [v9] dominant_mode: when we lead by ≥3x ships AND ≥1.2x production vs weakest
+  1. [v10] Opportunist scoring: dogpile_bonus 1.8→2.5x; added snipe_bonus (2x) when
+     enemy garrison < 50% of third-party fleet en route — pile on for free captures.
+  2. [v10] zero-neutral aggression: enemy_bonus 5x when neutrals_left==0 (was 3x).
+  3. [v10] prod_bonus when losing_prod: 1.6→2.0x — more urgency to flip enemy prod.
+  4. [v10] elimination_mode ship cap raised 200→300 — start eliminating earlier.
+  5. [v10] clock pressure: turn>400 drops reserve an additional 30% — end-game all-in.
+  6. [v9] dominant_mode: when we lead by ≥3x ships AND ≥1.2x production vs weakest
      enemy, drop reserve to ~3% and apply 5x elim_bonus — close out the game fast.
      Safely bridges the gap between normal play and full elimination_mode.
-  2. [v9] elim_bonus tiers: dominant_mode → 5x, elimination_mode → 3x, else 1x.
+  7. [v9] elim_bonus tiers: dominant_mode → 5x, elimination_mode → 3x, else 1x.
      Strongly funnels ships to finish off weakest enemy once we're dominant.
-  3. [v9] Phase 1 defense lock uses reserve_div=3 for both elimination/dominant_mode.
-  4. [v9] Phase 3 dispatch guard includes dominant_mode: partial attack allowed when
+  8. [v9] Phase 1 defense lock uses reserve_div=3 for both elimination/dominant_mode.
+  9. [v9] Phase 3 dispatch guard includes dominant_mode: partial attack allowed when
      dominant. Threshold lowered to max(10, garrison*0.40) from 0.45.
-  5. [v9] Late-game reserve reduced: 22% (turns 150-350), 28% (350+) — frees ships
+ 10. [v9] Late-game reserve reduced: 22% (turns 150-350), 28% (350+) — frees ships
      for offense in the endgame when we should be closing out. (Mid-game 0-150 kept
      at v8's 18% after testing showed 12% hurt more than it helped.)
-  6. [v8] Phase 4 chip attacks: single-source per neutral — chip down high-garrison
+ 11. [v8] Phase 4 chip attacks: single-source per neutral — chip down high-garrison
      neutrals we can't yet capture (neutrals don't regenerate, chips stack). Only
      ONE source planet per neutral per turn to avoid wasted multi-chip overlap.
-  7. [v8] Lower prod_buffer (4x vs 6x): more aggressive enemy planet captures.
-  8. [v8] Phase 1 skips tiny planets (production < 2): don't waste ships defending
-     low-value planets — redirect those ships to offense instead.
-  9. [v8] Raised elimination_mode cap to 200 ships (was 150).
- 10. [v7] 4-player metric fixes: compare against max SINGLE enemy (not combined).
- 11. Multiple source planets can target the same neutral cooperatively.
- 12. Orbit-aware fleet detection: predict planet positions at fleet ETA to correctly
+ 12. [v8] Raised elimination_mode cap (now 300) ships.
+ 13. [v7] 4-player metric fixes: compare against max SINGLE enemy (not combined).
+ 14. Multiple source planets can target the same neutral cooperatively.
+ 15. Orbit-aware fleet detection: predict planet positions at fleet ETA to correctly
      identify incoming threat targets for both orbiting and static planets.
- 13. Multi-ally reinforcement in Phase 1: cover incoming fleet threats with
+ 16. Multi-ally reinforcement in Phase 1: cover incoming fleet threats with
      combined fleets from multiple nearby planets.
- 14. [v3] 4-player: proper third-party dogpile detection.
- 15. [v4] Elimination mode: when weakest enemy total ships < 40% of ours,
+ 17. [v3] 4-player: proper third-party dogpile detection.
+ 18. [v4] Elimination mode: when weakest enemy total ships < 40% of ours,
      set 1/3-reserve and give their planets 3x bonus - flood them.
- 16. [v4] Comet awareness: treat comets as high-value neutral targets (2x bonus).
- 17. [v5] Production scoring: prod^1.3 to strongly bias toward high-value planets.
-     (prod^1.4 tested and reverted — slightly hurt 86% vs starter.)
- 18. [v3] 1.4x weak_bonus for weakest enemy (1.8x tested and reverted — hurt 86%).
- 19. [v6] Multi-fleet dispatch: env processes ALL moves per planet per turn (confirmed
+ 19. [v4] Comet awareness: treat comets as high-value neutral targets (2x bonus).
+ 20. [v5] Production scoring: prod^1.3 to strongly bias toward high-value planets.
+ 21. [v3] 1.4x weak_bonus for weakest enemy.
+ 22. [v6] Multi-fleet dispatch: env processes ALL moves per planet per turn (confirmed
      from env source). Neutrals: unlimited multi-dispatch. Enemies: one attack per
      planet per turn (prevents post-neutral ship bleed).
 
@@ -104,14 +106,19 @@ def _hits_sun(x1, y1, x2, y2):
 
 
 def _reserve(ships, turn):
-    """Ships to keep at home. Aggressive early, moderate late (v9b — reverted to v8 base)."""
+    """Ships to keep at home. Aggressive early, moderate late, all-in endgame."""
     if turn < 50:
         return max(2, int(ships * 0.04))
     if turn < 150:
-        return max(10, int(ships * 0.18))  # v9b: restored v8 value
+        return max(10, int(ships * 0.18))
     if turn < 350:
-        return max(15, int(ships * 0.22))  # keep v9 slight reduction
-    return max(20, int(ships * 0.28))      # keep v9 slight reduction
+        r = max(15, int(ships * 0.22))
+    else:
+        r = max(20, int(ships * 0.28))
+    # [v10] clock pressure: final 100 turns → shed 30% more reserve
+    if turn > 400:
+        r = max(10, int(r * 0.70))
+    return r
 
 
 def _parse_fleets(fleets, player, pid_map, ang_vel):
@@ -201,7 +208,7 @@ def _decide(obs):
 
     my_total = sum(p.ships for p in my_planets)
     weakest_ships = enemy_strength.get(weakest_enemy, 9999) if weakest_enemy else 9999
-    elimination_mode = (weakest_ships < my_total * 0.40 and weakest_ships < 200)
+    elimination_mode = (weakest_ships < my_total * 0.40 and weakest_ships < 300)  # [v10] cap 200→300
 
     # dominant_mode: we're clearly winning → go all-in to close the game
     dominant_mode = (
@@ -274,15 +281,20 @@ def _decide(obs):
             static_bonus  = 2.5 if _is_static(t) else 1.0
             neutral_bonus = 1.5 if t.owner == -1 else 1.0
             comet_bonus   = 2.0 if t.id in comet_ids else 1.0
-            enemy_bonus   = (3.0 if few_neutrals else 2.0) if t.owner not in (-1, player) else 1.0
-            prod_bonus    = 1.6 if (t.owner not in (-1, player) and losing_prod) else 1.0
+            # [v10] zero-neutral: 5x when no neutrals left, 3x when few
+            enemy_bonus   = (5.0 if neutrals_left == 0 else 3.0 if few_neutrals else 2.0) if t.owner not in (-1, player) else 1.0
+            prod_bonus    = 2.0 if (t.owner not in (-1, player) and losing_prod) else 1.0  # [v10] 1.6→2.0
             elim_bonus    = (5.0 if (dominant_mode and t.owner == weakest_enemy)
                              else 3.0 if (elimination_mode and t.owner == weakest_enemy)
                              else 1.0)
             weak_bonus    = 1.4 if (not elimination_mode and not dominant_mode and t.owner == weakest_enemy) else 1.0
-            dogpile_bonus = 1.8 if third_party_en.get(t.id, 0) > 0 else 1.0
+            # [v10] dogpile 1.8→2.5; snipe_bonus when third-party already > 50% of garrison
+            third_ships   = third_party_en.get(t.id, 0)
+            dogpile_bonus = 2.5 if third_ships > 0 else 1.0
+            snipe_bonus   = 2.0 if (third_ships > 0 and t.owner not in (-1, player)
+                                    and third_ships > t.ships * 0.5) else 1.0
             score = (static_bonus * neutral_bonus * comet_bonus * enemy_bonus
-                     * prod_bonus * elim_bonus * weak_bonus * dogpile_bonus
+                     * prod_bonus * elim_bonus * weak_bonus * dogpile_bonus * snipe_bonus
                      * (t.production ** 1.3) / (dist * max(net_garr, 1.0)))
             candidates.append((score, mine.id, t.id, eta, tx, ty, net_garr))
 
