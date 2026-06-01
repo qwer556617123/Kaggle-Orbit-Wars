@@ -1,27 +1,36 @@
-"""
-Orbit Wars — Tier 2 Efficient Expansion Agent  (v5 — aggressive reserve + prod^1.3)
+﻿"""
+Orbit Wars - Tier 2 Efficient Expansion Agent  (v8)
 
-Strategy: expand precisely without wasting ships, then switch to harassment/capture
-in direct combat when few neutrals remain. In 4-player, focus-fire the weakest
-enemy to eliminate them and inherit their planets.
+Strategy: aggressive expansion with chip attacks, focus-fire weakest enemy,
+eliminate players early in 4-player games.
 
 Key design decisions:
-  1. No chip attacks on neutrals — only send when we can guarantee capture.
-  2. Multiple source planets can target the same neutral cooperatively.
-  3. [v5] Aggressive reserve: 4% early → 18% mid → 25% late (land-grab speed).
+  1. [v8] Phase 4 chip attacks: single-source per neutral — chip down high-garrison
+     neutrals we can't yet capture (neutrals don't regenerate, chips stack). Only
+     ONE source planet per neutral per turn to avoid wasted multi-chip overlap.
+  2. [v8] Lower prod_buffer (4x vs 6x): more aggressive enemy planet captures.
+  3. [v8] Phase 1 skips tiny planets (production < 2): don't waste ships defending
+     low-value planets — redirect those ships to offense instead.
+  4. [v8] Raised elimination_mode cap to 200 ships (was 150).
+  5. [v7] 4-player metric fixes: compare against max SINGLE enemy (not combined).
+  6. Multiple source planets can target the same neutral cooperatively.
+  7. [v5] Aggressive reserve: 4% early -> 18% mid -> 25% late (land-grab speed).
      Halved reserve when behind on planet count (aggressive catch-up mode).
-  4. Orbit-aware fleet detection: predict planet positions at fleet ETA to correctly
+  8. Orbit-aware fleet detection: predict planet positions at fleet ETA to correctly
      identify incoming threat targets for both orbiting and static planets.
-  5. Multi-ally reinforcement in Phase 1: cover incoming fleet threats with
+  9. Multi-ally reinforcement in Phase 1: cover incoming fleet threats with
      combined fleets from multiple nearby planets.
-  6. [v5] Lower harassment threshold: max(10, garrison*0.45) to drain enemies more.
+ 10. [v5] Lower harassment threshold: max(10, garrison*0.45) to drain enemies more.
      Also triggers when behind on planets (was only losing_prod/few_neutrals).
-  7. [v3] 4-player: proper third-party dogpile detection.
-  8. [v3] 4-player: 1.4x bonus for targeting the weakest enemy player.
-  9. [v4] Elimination mode: when weakest enemy total ships < 40% of ours,
-     set 1/3-reserve and give their planets 3x bonus — flood them.
- 10. [v4] Comet awareness: treat comets as high-value neutral targets (2x bonus).
- 11. [v5] Production scoring: use prod^1.3 to strongly bias toward high-value planets.
+ 11. [v3] 4-player: proper third-party dogpile detection.
+ 12. [v3] 4-player: 1.4x bonus for targeting the weakest enemy player.
+ 13. [v4] Elimination mode: when weakest enemy total ships < 40% of ours,
+     set 1/3-reserve and give their planets 3x bonus - flood them.
+ 14. [v4] Comet awareness: treat comets as high-value neutral targets (2x bonus).
+ 15. [v5] Production scoring: use prod^1.3 to strongly bias toward high-value planets.
+ 16. [v6] Multi-fleet dispatch: env processes ALL moves per planet per turn (confirmed
+     from env source). Neutrals: unlimited multi-dispatch. Enemies: one attack per
+     planet per turn (prevents post-neutral ship bleed).
 
 Public API
 ----------
@@ -89,9 +98,9 @@ def _hits_sun(x1, y1, x2, y2):
 def _reserve(ships, turn):
     """Ships to keep at home. Aggressive early, moderate late."""
     if turn < 50:
-        return max(2, int(ships * 0.04))   # near-zero early: land grab phase
+        return max(2, int(ships * 0.04))
     if turn < 150:
-        return max(10, int(ships * 0.18))  # lighter mid-game (was 30%)
+        return max(10, int(ships * 0.18))
     if turn < 350:
         return max(15, int(ships * 0.25))
     return max(20, int(ships * 0.32))
@@ -100,10 +109,9 @@ def _reserve(ships, turn):
 def _parse_fleets(fleets, player, pid_map, ang_vel):
     """Return (friendly_en_route, hostile_en_route, third_party_en_route).
 
-    friendly:    our fleets  → planet_id -> ships
-    hostile:     all non-us  → planet_id -> ships
-    third_party: fleets by enemy X heading to enemy Y's planet (X≠Y, X≠player)
-                 — real dogpile signal usable in 4-player games
+    friendly:    our fleets  -> planet_id -> ships
+    hostile:     all non-us  -> planet_id -> ships
+    third_party: fleets by enemy X heading to enemy Y's planet (X!=Y, X!=player)
     """
     friendly, hostile, third_party = {}, {}, {}
     for f in fleets:
@@ -127,7 +135,6 @@ def _parse_fleets(fleets, player, pid_map, ang_vel):
             friendly[best_pid] = friendly.get(best_pid, 0) + f.ships
         else:
             hostile[best_pid] = hostile.get(best_pid, 0) + f.ships
-            # Third-party: attacker ≠ planet owner (genuine dogpile, not reinforcement)
             tgt = pid_map.get(best_pid)
             if tgt and tgt.owner not in (-1, player) and f.owner != tgt.owner:
                 third_party[best_pid] = third_party.get(best_pid, 0) + f.ships
@@ -149,7 +156,6 @@ def _decide(obs):
     planets = [Planet(*p) for p in _g(obs, "planets", [])]
     fleets  = [Fleet(*f)  for f in _g(obs, "fleets",  [])]
 
-    # Comet IDs — high-value fleeting neutrals worth grabbing
     comet_ids = set(_g(obs, "comet_planet_ids", []))
 
     my_planets = [p for p in planets if p.owner == player]
@@ -160,16 +166,24 @@ def _decide(obs):
         return []
 
     my_prod    = sum(p.production for p in my_planets)
-    their_prod = sum(p.production for p in planets if p.owner not in (-1, player))
-    losing_prod = their_prod > my_prod * 1.2
-
     enemy_planets = [p for p in planets if p.owner not in (-1, player)]
-    behind_on_planets = len(enemy_planets) > len(my_planets) + 1
+    enemy_pids = set(p.owner for p in enemy_planets)
+
+    max_enemy_prod = max(
+        (sum(p.production for p in enemy_planets if p.owner == e) for e in enemy_pids),
+        default=0
+    ) if enemy_pids else 0
+    losing_prod = max_enemy_prod > my_prod * 1.2
+
+    max_enemy_planet_count = max(
+        (sum(1 for p in enemy_planets if p.owner == e) for e in enemy_pids),
+        default=0
+    ) if enemy_pids else 0
+    behind_on_planets = max_enemy_planet_count > len(my_planets) + 1
     neutrals_left = sum(1 for p in planets if p.owner == -1 and p.id not in comet_ids)
     few_neutrals = neutrals_left < 4
 
-    # ── 4-player: track each enemy's total strength (planets + fleets) ────────
-    enemy_strength: dict = {}
+    enemy_strength = {}
     for p in enemy_planets:
         enemy_strength[p.owner] = enemy_strength.get(p.owner, 0.0) + p.ships
     for f in fleets:
@@ -177,18 +191,17 @@ def _decide(obs):
             enemy_strength[f.owner] = enemy_strength.get(f.owner, 0.0) + f.ships
     weakest_enemy = min(enemy_strength, key=enemy_strength.get) if enemy_strength else None
 
-    # Elimination mode: weakest enemy has < 40% of our ships — flood them
     my_total = sum(p.ships for p in my_planets)
     weakest_ships = enemy_strength.get(weakest_enemy, 9999) if weakest_enemy else 9999
-    elimination_mode = (weakest_ships < my_total * 0.40 and weakest_ships < 150)
+    elimination_mode = (weakest_ships < my_total * 0.40 and weakest_ships < 200)
 
     friendly_en, hostile_en, third_party_en = _parse_fleets(fleets, player, pid_map, ang_vel)
 
     moves       = []
     source_used = set()
-    sending_to  = {}   # target_id -> ships we dispatch this turn
+    sending_to  = {}
 
-    # ── Phase 1: Reinforce threatened planets ─────────────────────────────────
+    # Phase 1: Reinforce threatened planets
     for mine in sorted(my_planets, key=lambda p: -hostile_en.get(p.id, 0)):
         threat = hostile_en.get(mine.id, 0)
         if threat == 0:
@@ -197,7 +210,6 @@ def _decide(obs):
         if threat <= defense:
             continue
         shortfall = int(threat - defense) + 2
-        # In elimination mode, don't over-invest in defense — stay aggressive
         reserve_div = 3 if elimination_mode else 2
         allies = sorted(
             [a for a in my_planets if a.id != mine.id and a.id not in source_used],
@@ -215,13 +227,12 @@ def _decide(obs):
             source_used.add(ally.id)
             shortfall -= contrib
 
-    # ── Phase 2: Score all (source, target) pairs ─────────────────────────────
+    # Phase 2: Score all (source, target) pairs
     candidates = []
     for mine in my_planets:
         if mine.id in source_used:
             continue
         if elimination_mode:
-            # Half reserve when going for kill
             base_res = _reserve(mine.ships, _turn) // 3
         elif behind_on_planets:
             base_res = _reserve(mine.ships, _turn) // 2
@@ -246,17 +257,12 @@ def _decide(obs):
 
             static_bonus  = 2.5 if _is_static(t) else 1.0
             neutral_bonus = 1.5 if t.owner == -1 else 1.0
-            # Comets: high urgency — they disappear, treat as 2x neutral bonus
             comet_bonus   = 2.0 if t.id in comet_ids else 1.0
             enemy_bonus   = (3.0 if few_neutrals else 2.0) if t.owner not in (-1, player) else 1.0
             prod_bonus    = 1.6 if (t.owner not in (-1, player) and losing_prod) else 1.0
-            # Elimination: 3x on weakest enemy planets when we're in kill mode
             elim_bonus    = 3.0 if (elimination_mode and t.owner == weakest_enemy) else 1.0
-            # Standard weak-enemy targeting even outside elimination mode
             weak_bonus    = 1.4 if (not elimination_mode and t.owner == weakest_enemy) else 1.0
-            # Dogpile: confirmed third-party attacker heading to this enemy planet
             dogpile_bonus = 1.8 if third_party_en.get(t.id, 0) > 0 else 1.0
-            # Use production^1.3 to more strongly favor high-production planets
             score = (static_bonus * neutral_bonus * comet_bonus * enemy_bonus
                      * prod_bonus * elim_bonus * weak_bonus * dogpile_bonus
                      * (t.production ** 1.3) / (dist * max(net_garr, 1.0)))
@@ -274,10 +280,11 @@ def _decide(obs):
         mine_avail = {p.id: max(0, p.ships - _reserve(p.ships, _turn))
                       for p in my_planets if p.id not in source_used}
 
-    # ── Phase 3: Greedy dispatch ───────────────────────────────────────────────
+    # Phase 3: Greedy multi-target dispatch
+    # Multi-fleet is legal per env source. Neutrals: multi-dispatch allowed.
+    # Enemies: one attack per planet per turn to prevent ship bleed.
+    enemy_dispatched = set()
     for score, mine_id, t_id, eta, tx, ty, _ in candidates:
-        if mine_id in source_used:
-            continue
         avail = mine_avail.get(mine_id, 0)
         if avail < 1:
             continue
@@ -285,6 +292,10 @@ def _decide(obs):
         t = pid_map[t_id]
         is_neutral = t.owner == -1
         is_comet   = t.id in comet_ids
+        is_enemy   = t.owner not in (-1, player)
+
+        if is_enemy and mine_id in enemy_dispatched:
+            continue
 
         already = friendly_en.get(t_id, 0) + sending_to.get(t_id, 0)
         if is_neutral:
@@ -297,15 +308,13 @@ def _decide(obs):
             needed = int(net_garr) + 2
             if net_garr <= 0:
                 continue
-            if avail < needed:
-                if avail > net_garr:
-                    ships_to_send = avail
-                else:
-                    continue
-            else:
+            if avail >= needed:
                 ships_to_send = needed
+            elif avail > net_garr:
+                ships_to_send = avail  # barely captures
+            else:
+                continue
         else:
-            # In elimination mode, be willing to send more to finish off weak enemy
             prod_buffer = max(8, int(t.production * 6))
             if elimination_mode and t.owner == weakest_enemy:
                 prod_buffer = max(4, int(t.production * 3))
@@ -325,8 +334,50 @@ def _decide(obs):
 
         angle = math.atan2(ty - mine.y, tx - mine.x)
         moves.append([mine_id, angle, ships_to_send])
-        source_used.add(mine_id)
         sending_to[t_id] = sending_to.get(t_id, 0) + ships_to_send
         mine_avail[mine_id] -= ships_to_send
+        if is_enemy:
+            enemy_dispatched.add(mine_id)
+        # Lock planet after dispatch if reserves are getting thin
+        # (prevents multi-fleet draining planets below safe defense level)
+        base_res = _reserve(pid_map[mine_id].ships, _turn)
+        if mine_avail.get(mine_id, 0) < base_res * 2:
+            source_used.add(mine_id)
+
+    # Phase 4: single-source chip attacks on neutrals we can't yet capture directly.
+    # Neutrals don't regenerate — chips stack, enabling capture earlier.
+    # Only ONE source per neutral per turn to prevent multi-chip ship waste.
+    # Only chip when planet is NOT under threat and has large surplus.
+    chipped_this_turn = set()
+    chip_targets = [p for p in planets if p.owner == -1
+                    and p.id not in comet_ids and p.production >= 2]
+    for mine in sorted([p for p in my_planets if p.id not in source_used],
+                       key=lambda p: mine_avail.get(p.id, 0), reverse=True):
+        avail = mine_avail.get(mine.id, 0)
+        if avail < 25:
+            continue
+        if hostile_en.get(mine.id, 0) > 0:
+            continue  # planet is under threat — keep ships for defense
+        for t in sorted(chip_targets,
+                        key=lambda n: math.hypot(n.x - mine.x, n.y - mine.y)):
+            already = sending_to.get(t.id, 0)
+            eff_garr = t.ships - already
+            if eff_garr <= 0 or avail >= eff_garr + 2:
+                continue  # already being captured or we can capture directly
+            if t.id in chipped_this_turn:
+                continue  # another planet is already chipping this neutral
+            # Reduce garrison to ~2x current avail so we can capture when ships double
+            chip = min(avail - 10, max(15, eff_garr - avail * 2))
+            if chip < 10:
+                continue
+            eta, tx, ty = _intercept(mine.x, mine.y, t, chip, ang_vel)
+            if _hits_sun(mine.x, mine.y, tx, ty):
+                continue
+            angle = math.atan2(ty - mine.y, tx - mine.x)
+            moves.append([mine.id, angle, chip])
+            mine_avail[mine.id] = max(0, mine_avail.get(mine.id, 0) - chip)
+            sending_to[t.id] = sending_to.get(t.id, 0) + chip
+            chipped_this_turn.add(t.id)
+            break  # one chip target per source planet per turn
 
     return moves
