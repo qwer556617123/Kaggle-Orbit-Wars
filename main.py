@@ -1,5 +1,5 @@
 """
-Orbit Wars — Tier 2 Efficient Expansion Agent  (v2 — consolidation + safe harassment)
+Orbit Wars — Tier 2 Efficient Expansion Agent  (v3 — 4-player aware)
 
 Strategy: expand precisely without wasting ships, then switch to harassment/capture
 in direct combat when few neutrals remain.
@@ -15,11 +15,12 @@ Key design decisions:
      combined fleets from multiple nearby planets.
   6. Direct combat mode (< 4 neutrals): harass enemy garrisons even without
      guarantee of capture, scoring enemy planets 3× higher than neutral.
-  7. [v2] Consolidation mode: when total enemy ships > 85% of our ships, neutral
-     captures require the source to keep ≥ 10 ships post-send.  Prevents the
-     "thin overexpansion" failure mode where we win planet count but lose ship count.
-  8. [v2] Harassment restricted to losing_prod only: removed few_neutrals from the
-     harassment trigger to stop burning ships on failed attacks while we're ahead.
+  7. [v3] 4-player: proper third-party dogpile detection — distinguish enemy
+     reinforcements from a different enemy attacking the same planet.
+     Subtract confirmed third-party attackers from garrison estimate.
+  8. [v3] 4-player: 1.4x bonus for targeting the weakest enemy player's planets.
+  9. [v3] 4-player: 1.5x dogpile bonus when another enemy fleet is already
+     attacking the target (based on third-party fleet detection).
 
 Public API
 ----------
@@ -96,14 +97,16 @@ def _reserve(ships, turn):
 
 
 def _parse_fleets(fleets, player, pid_map, ang_vel):
-    """Return (friendly_en_route, enemy_en_route): {planet_id -> ships}.
+    """Return (friendly_en_route, hostile_en_route, third_party_en_route).
 
-    Hybrid approach: check fleet angle against bearing to each planet's
-    predicted position at rough ETA.
+    friendly:    our fleets  → planet_id -> ships
+    hostile:     all non-us  → planet_id -> ships
+    third_party: fleets by enemy X heading to enemy Y's planet (X≠Y, X≠player)
+                 — real dogpile signal usable in 4-player games
     """
-    friendly, enemy = {}, {}
+    friendly, hostile, third_party = {}, {}, {}
     for f in fleets:
-        best_pid, best_diff = None, 0.30   # angle tolerance in radians
+        best_pid, best_diff = None, 0.30
         spd = _speed(max(1, f.ships))
         for pid, p in pid_map.items():
             rough_eta = math.hypot(p.x - f.x, p.y - f.y) / spd
@@ -114,7 +117,6 @@ def _parse_fleets(fleets, player, pid_map, ang_vel):
             diff = abs(math.atan2(math.sin(f.angle - bearing),
                                   math.cos(f.angle - bearing)))
             dist_to_pred = math.hypot(pred_x - f.x, pred_y - f.y)
-            # Weight by closeness to planet (prefer nearby planets)
             if diff < best_diff and dist_to_pred < 160:
                 best_diff = diff
                 best_pid = pid
@@ -123,8 +125,12 @@ def _parse_fleets(fleets, player, pid_map, ang_vel):
         if f.owner == player:
             friendly[best_pid] = friendly.get(best_pid, 0) + f.ships
         else:
-            enemy[best_pid] = enemy.get(best_pid, 0) + f.ships
-    return friendly, enemy
+            hostile[best_pid] = hostile.get(best_pid, 0) + f.ships
+            # Third-party: attacker ≠ planet owner (genuine dogpile, not reinforcement)
+            tgt = pid_map.get(best_pid)
+            if tgt and tgt.owner not in (-1, player) and f.owner != tgt.owner:
+                third_party[best_pid] = third_party.get(best_pid, 0) + f.ships
+    return friendly, hostile, third_party
 
 
 def agent(obs):
@@ -154,44 +160,34 @@ def _decide(obs):
     losing_prod = their_prod > my_prod * 1.2
 
     enemy_planets = [p for p in planets if p.owner not in (-1, player)]
-    # If enemy holds more planets, we need faster expansion (lower reserve)
     behind_on_planets = len(enemy_planets) > len(my_planets) + 1
-    # Direct combat mode: few neutrals left, focus on draining enemy
     neutrals_left = sum(1 for p in planets if p.owner == -1)
     few_neutrals = neutrals_left < 4
 
-    # ── Situational flags ─────────────────────────────────────────────────────
-    total_my_ships    = sum(p.ships for p in my_planets)
-    total_enemy_ships = sum(p.ships for p in enemy_planets)
-    avg_garrison      = total_my_ships / max(len(my_planets), 1)
+    # ── 4-player: track each enemy's total strength (planets + fleets) ────────
+    enemy_strength: dict[int, float] = {}
+    for p in enemy_planets:
+        enemy_strength[p.owner] = enemy_strength.get(p.owner, 0.0) + p.ships
+    for f in fleets:
+        if f.owner not in (-1, player):
+            enemy_strength[f.owner] = enemy_strength.get(f.owner, 0.0) + f.ships
+    weakest_enemy = min(enemy_strength, key=enemy_strength.get) if enemy_strength else None
 
-    # [v2-fix1] Thin-expansion limiter: when avg garrison is dangerously low and
-    # we're still in the expansion phase, cap neutral captures to 2 per turn.
-    # Threshold avg<15 cleanly separates failing seeds (8–13) from winning ones (16+).
-    thin_expanding = avg_garrison < 15 and _turn < 100
-
-    # [v2-fix2] Late-game garrison guard: as neutrals run out (approaching combat
-    # mode), require the source planet to keep ≥ 10 ships after a neutral capture.
-    # Prevents stripping thin planets right before the enemy starts attacking.
-    late_game_guard = neutrals_left <= 5 and _turn >= 50
-
-    friendly_en, enemy_en = _parse_fleets(fleets, player, pid_map, ang_vel)
+    friendly_en, hostile_en, third_party_en = _parse_fleets(fleets, player, pid_map, ang_vel)
 
     moves       = []
     source_used = set()
     sending_to  = {}   # target_id -> ships we dispatch this turn
 
     # ── Phase 1: Reinforce threatened planets ─────────────────────────────────
-    for mine in sorted(my_planets, key=lambda p: -enemy_en.get(p.id, 0)):
-        threat = enemy_en.get(mine.id, 0)
+    for mine in sorted(my_planets, key=lambda p: -hostile_en.get(p.id, 0)):
+        threat = hostile_en.get(mine.id, 0)
         if threat == 0:
             continue
-        # Use only current garrison + incoming friendlies (no production speculation)
         defense = mine.ships + friendly_en.get(mine.id, 0)
         if threat <= defense:
             continue
         shortfall = int(threat - defense) + 2
-        # Allow multiple nearby allies to together cover the shortfall
         allies = sorted(
             [a for a in my_planets if a.id != mine.id and a.id not in source_used],
             key=lambda a: math.hypot(a.x - mine.x, a.y - mine.y)
@@ -225,29 +221,32 @@ def _decide(obs):
 
             dist = max(math.hypot(tx - mine.x, ty - mine.y), 1e-6)
 
-            # Garrison at arrival (neutrals don't grow)
             raw_garr = t.ships if t.owner == -1 else t.ships + t.production * eta
-            # Net garrison after already-committed ships
-            already = friendly_en.get(t.id, 0) + sending_to.get(t.id, 0)
+            already  = friendly_en.get(t.id, 0) + sending_to.get(t.id, 0)
+            # For enemy planets: subtract confirmed third-party attackers from garrison
+            if t.owner not in (-1, player):
+                already += third_party_en.get(t.id, 0)
             net_garr = max(0.0, raw_garr - already)
 
             static_bonus  = 2.5 if _is_static(t) else 1.0
             neutral_bonus = 1.5 if t.owner == -1 else 1.0
-            # Boost enemy planet priority in direct combat (few neutrals)
             enemy_bonus   = (3.0 if few_neutrals else 2.0) if t.owner not in (-1, player) else 1.0
             prod_bonus    = 1.6 if (t.owner not in (-1, player) and losing_prod) else 1.0
+            # 4-player: 1.4x bonus for targeting the weakest enemy player
+            weak_bonus    = 1.4 if (t.owner == weakest_enemy) else 1.0
+            # 4-player: 1.5x bonus when a third enemy is already attacking this planet
+            dogpile_bonus = 1.5 if third_party_en.get(t.id, 0) > 0 else 1.0
             score = (static_bonus * neutral_bonus * enemy_bonus * prod_bonus
+                     * weak_bonus * dogpile_bonus
                      * t.production / (dist * max(net_garr, 1.0)))
             candidates.append((score, mine.id, t.id, eta, tx, ty, net_garr))
 
     candidates.sort(key=lambda c: c[0], reverse=True)
 
-    # Pre-compute available ships per source
     mine_avail = {p.id: max(0, p.ships - (_reserve(p.ships, _turn) // 2 if behind_on_planets else _reserve(p.ships, _turn)))
                   for p in my_planets if p.id not in source_used}
 
     # ── Phase 3: Greedy dispatch ───────────────────────────────────────────────
-    neutral_cap = 0  # tracks neutral captures this turn (throttled when thin_expanding)
     for score, mine_id, t_id, eta, tx, ty, _ in candidates:
         if mine_id in source_used:
             continue
@@ -258,44 +257,30 @@ def _decide(obs):
         t = pid_map[t_id]
         is_neutral = t.owner == -1
 
-        # Recompute net garrison with latest sending_to
         already = friendly_en.get(t_id, 0) + sending_to.get(t_id, 0)
         if is_neutral:
             net_garr = max(0.0, t.ships - already)
         else:
-            net_garr = max(0.0, t.ships + t.production * eta - already)
+            net_garr = max(0.0, t.ships + t.production * eta - already
+                           - third_party_en.get(t_id, 0))
 
         if is_neutral:
-            needed = int(net_garr) + 2   # minimal buffer — neutrals don't regenerate
+            needed = int(net_garr) + 2
             if net_garr <= 0:
-                continue  # already covered
-
-            mine_src = pid_map[mine_id]
-
-            # [v2-fix1] Thin-expansion cap: when avg garrison is low, only fire the
-            # top 2 neutral captures per turn so remaining planets build up garrison.
-            if thin_expanding and neutral_cap >= 2:
                 continue
-
-            # [v2-fix2] Late-game garrison guard: as neutrals near exhaustion,
-            # only capture if the source planet stays healthy (≥ 10 ships after send).
-            if late_game_guard and avail >= needed and (mine_src.ships - needed) < 10:
-                continue  # would leave source dangerously thin; skip this capture
-
             if avail < needed:
-                # Allow sending when we're close enough to capture
-                if avail > net_garr:   # strictly more ships than garrison = flip guaranteed
+                if avail > net_garr:
                     ships_to_send = avail
                 else:
-                    continue           # genuinely can't capture yet, wait
+                    continue
             else:
-                ships_to_send = needed  # minimum-cost capture
+                ships_to_send = needed
         else:
             needed = int(net_garr) + max(8, int(t.production * 6))
             if avail >= needed:
                 ships_to_send = needed
             elif avail >= max(15, int(net_garr * 0.60)) and (losing_prod or few_neutrals):
-                ships_to_send = avail  # harassment: drain when losing or in combat phase
+                ships_to_send = avail
             else:
                 continue
 
@@ -310,7 +295,5 @@ def _decide(obs):
         source_used.add(mine_id)
         sending_to[t_id] = sending_to.get(t_id, 0) + ships_to_send
         mine_avail[mine_id] -= ships_to_send
-        if is_neutral:
-            neutral_cap += 1  # track for thin_expanding throttle
 
     return moves
