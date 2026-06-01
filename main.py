@@ -9,10 +9,13 @@ Key design decisions:
   1. [v11] retake_penalty: penalize enemy targets surrounded by same-owner enemy
      planets (min_same_enemy_dist / 30, clamped 0.4-1.0). Prevents battle cycling —
      capturing islands deep in enemy territory that get immediately retaken.
-  2. [v10] Opportunist scoring: dogpile_bonus 1.8→2.5x; added snipe_bonus (2x) when
+  2. [v11] neutral-first early game: when neutrals_left ≥ 6, enemy_bonus = 1.5
+     (equals neutral_bonus). Prioritize expansion over enemy attacks when neutrals
+     are plentiful — frees early ships for cheaper captures, better snowball.
+  3. [v10] Opportunist scoring: dogpile_bonus 1.8→2.5x; added snipe_bonus (2x) when
      enemy garrison < 50% of third-party fleet en route — pile on for free captures.
-  3. [v10] zero-neutral aggression: enemy_bonus 5x when neutrals_left==0 (was 3x).
-  4. [v10] prod_bonus when losing_prod: 1.6→2.0x — more urgency to flip enemy prod.
+  4. [v10] zero-neutral aggression: enemy_bonus 5x when neutrals_left==0 (was 3x).
+  5. [v10] prod_bonus when losing_prod: 1.6→2.0x — more urgency to flip enemy prod.
   5. [v10] elimination_mode ship cap raised 200→300 — start eliminating earlier.
   6. [v10] clock pressure: turn>400 drops reserve an additional 30% — end-game all-in.
   7. [v9] dominant_mode: when we lead by ≥3x ships AND ≥1.2x production vs weakest
@@ -285,8 +288,18 @@ def _decide(obs):
             static_bonus  = 2.5 if _is_static(t) else 1.0
             neutral_bonus = 1.5 if t.owner == -1 else 1.0
             comet_bonus   = 2.0 if t.id in comet_ids else 1.0
-            # [v10] zero-neutral: 5x when no neutrals left, 3x when few
-            enemy_bonus   = (5.0 if neutrals_left == 0 else 3.0 if few_neutrals else 2.0) if t.owner not in (-1, player) else 1.0
+            # [v11] early-game: don't over-prioritize enemies when neutrals are plentiful
+            if t.owner not in (-1, player):
+                if neutrals_left == 0:
+                    enemy_bonus = 5.0
+                elif few_neutrals:
+                    enemy_bonus = 3.0
+                elif neutrals_left >= 6:
+                    enemy_bonus = 1.5   # equal to neutral_bonus — expand first
+                else:
+                    enemy_bonus = 2.0
+            else:
+                enemy_bonus = 1.0
             prod_bonus    = 2.0 if (t.owner not in (-1, player) and losing_prod) else 1.0  # [v10] 1.6→2.0
             elim_bonus    = (5.0 if (dominant_mode and t.owner == weakest_enemy)
                              else 3.0 if (elimination_mode and t.owner == weakest_enemy)
@@ -312,7 +325,7 @@ def _decide(obs):
                      * prod_bonus * elim_bonus * weak_bonus * dogpile_bonus * snipe_bonus
                      * retake_penalty
                      * (t.production ** 1.3) / (dist * max(net_garr, 1.0)))
-            candidates.append((score, mine.id, t.id, eta, tx, ty, net_garr))
+            candidates.append((score, mine.id, t.id, eta, tx, ty, net_garr, retake_penalty))
 
     candidates.sort(key=lambda c: c[0], reverse=True)
 
@@ -330,7 +343,7 @@ def _decide(obs):
     # Multi-fleet is legal per env source. Neutrals: multi-dispatch allowed.
     # Enemies: one attack per planet per turn to prevent ship bleed.
     enemy_dispatched = set()
-    for score, mine_id, t_id, eta, tx, ty, _ in candidates:
+    for score, mine_id, t_id, eta, tx, ty, _, retake_p in candidates:
         avail = mine_avail.get(mine_id, 0)
         if avail < 1:
             continue
