@@ -1,5 +1,5 @@
 """
-Orbit Wars — Tier 2 Efficient Expansion Agent  (v4 — elimination + comet aware)
+Orbit Wars — Tier 2 Efficient Expansion Agent  (v5 — aggressive reserve + prod^1.3)
 
 Strategy: expand precisely without wasting ships, then switch to harassment/capture
 in direct combat when few neutrals remain. In 4-player, focus-fire the weakest
@@ -8,20 +8,20 @@ enemy to eliminate them and inherit their planets.
 Key design decisions:
   1. No chip attacks on neutrals — only send when we can guarantee capture.
   2. Multiple source planets can target the same neutral cooperatively.
-  3. Adaptive reserve: 8% early → 30% mid → 35% late, with halved reserve when
-     behind on planet count (aggressive catch-up mode).
+  3. [v5] Aggressive reserve: 4% early → 18% mid → 25% late (land-grab speed).
+     Halved reserve when behind on planet count (aggressive catch-up mode).
   4. Orbit-aware fleet detection: predict planet positions at fleet ETA to correctly
      identify incoming threat targets for both orbiting and static planets.
   5. Multi-ally reinforcement in Phase 1: cover incoming fleet threats with
      combined fleets from multiple nearby planets.
-  6. Direct combat mode (< 4 neutrals): harass enemy garrisons even without
-     guarantee of capture, scoring enemy planets 3× higher than neutral.
+  6. [v5] Lower harassment threshold: max(10, garrison*0.45) to drain enemies more.
+     Also triggers when behind on planets (was only losing_prod/few_neutrals).
   7. [v3] 4-player: proper third-party dogpile detection.
   8. [v3] 4-player: 1.4x bonus for targeting the weakest enemy player.
   9. [v4] Elimination mode: when weakest enemy total ships < 40% of ours,
-     set half-reserve for all moves and give their planets 3x bonus — flood them.
- 10. [v4] Comet awareness: treat comets as high-value neutral targets (they
-     have production but disappear, so low-cost expansion window).
+     set 1/3-reserve and give their planets 3x bonus — flood them.
+ 10. [v4] Comet awareness: treat comets as high-value neutral targets (2x bonus).
+ 11. [v5] Production scoring: use prod^1.3 to strongly bias toward high-value planets.
 
 Public API
 ----------
@@ -87,14 +87,14 @@ def _hits_sun(x1, y1, x2, y2):
 
 
 def _reserve(ships, turn):
-    """Ships to keep at home."""
-    if turn < 60:
-        return max(4, int(ships * 0.08))
+    """Ships to keep at home. Aggressive early, moderate late."""
+    if turn < 50:
+        return max(2, int(ships * 0.04))   # near-zero early: land grab phase
     if turn < 150:
-        return max(16, int(ships * 0.30))
+        return max(10, int(ships * 0.18))  # lighter mid-game (was 30%)
     if turn < 350:
-        return max(20, int(ships * 0.35))
-    return max(24, int(ships * 0.40))
+        return max(15, int(ships * 0.25))
+    return max(20, int(ships * 0.32))
 
 
 def _parse_fleets(fleets, player, pid_map, ang_vel):
@@ -256,9 +256,10 @@ def _decide(obs):
             weak_bonus    = 1.4 if (not elimination_mode and t.owner == weakest_enemy) else 1.0
             # Dogpile: confirmed third-party attacker heading to this enemy planet
             dogpile_bonus = 1.8 if third_party_en.get(t.id, 0) > 0 else 1.0
+            # Use production^1.3 to more strongly favor high-production planets
             score = (static_bonus * neutral_bonus * comet_bonus * enemy_bonus
                      * prod_bonus * elim_bonus * weak_bonus * dogpile_bonus
-                     * t.production / (dist * max(net_garr, 1.0)))
+                     * (t.production ** 1.3) / (dist * max(net_garr, 1.0)))
             candidates.append((score, mine.id, t.id, eta, tx, ty, net_garr))
 
     candidates.sort(key=lambda c: c[0], reverse=True)
@@ -311,7 +312,7 @@ def _decide(obs):
             needed = int(net_garr) + prod_buffer
             if avail >= needed:
                 ships_to_send = needed
-            elif avail >= max(15, int(net_garr * 0.60)) and (losing_prod or few_neutrals or elimination_mode):
+            elif avail >= max(10, int(net_garr * 0.45)) and (losing_prod or few_neutrals or elimination_mode or behind_on_planets):
                 ships_to_send = avail
             else:
                 continue
