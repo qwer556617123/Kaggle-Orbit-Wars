@@ -1,8 +1,9 @@
 """
-Orbit Wars — Tier 2 Efficient Expansion Agent  (v3 — 4-player aware)
+Orbit Wars — Tier 2 Efficient Expansion Agent  (v4 — elimination + comet aware)
 
 Strategy: expand precisely without wasting ships, then switch to harassment/capture
-in direct combat when few neutrals remain.
+in direct combat when few neutrals remain. In 4-player, focus-fire the weakest
+enemy to eliminate them and inherit their planets.
 
 Key design decisions:
   1. No chip attacks on neutrals — only send when we can guarantee capture.
@@ -15,12 +16,12 @@ Key design decisions:
      combined fleets from multiple nearby planets.
   6. Direct combat mode (< 4 neutrals): harass enemy garrisons even without
      guarantee of capture, scoring enemy planets 3× higher than neutral.
-  7. [v3] 4-player: proper third-party dogpile detection — distinguish enemy
-     reinforcements from a different enemy attacking the same planet.
-     Subtract confirmed third-party attackers from garrison estimate.
-  8. [v3] 4-player: 1.4x bonus for targeting the weakest enemy player's planets.
-  9. [v3] 4-player: 1.5x dogpile bonus when another enemy fleet is already
-     attacking the target (based on third-party fleet detection).
+  7. [v3] 4-player: proper third-party dogpile detection.
+  8. [v3] 4-player: 1.4x bonus for targeting the weakest enemy player.
+  9. [v4] Elimination mode: when weakest enemy total ships < 40% of ours,
+     set half-reserve for all moves and give their planets 3x bonus — flood them.
+ 10. [v4] Comet awareness: treat comets as high-value neutral targets (they
+     have production but disappear, so low-cost expansion window).
 
 Public API
 ----------
@@ -148,6 +149,9 @@ def _decide(obs):
     planets = [Planet(*p) for p in _g(obs, "planets", [])]
     fleets  = [Fleet(*f)  for f in _g(obs, "fleets",  [])]
 
+    # Comet IDs — high-value fleeting neutrals worth grabbing
+    comet_ids = set(_g(obs, "comet_planet_ids", []))
+
     my_planets = [p for p in planets if p.owner == player]
     targets    = [p for p in planets if p.owner != player]
     pid_map    = {p.id: p for p in planets}
@@ -161,17 +165,22 @@ def _decide(obs):
 
     enemy_planets = [p for p in planets if p.owner not in (-1, player)]
     behind_on_planets = len(enemy_planets) > len(my_planets) + 1
-    neutrals_left = sum(1 for p in planets if p.owner == -1)
+    neutrals_left = sum(1 for p in planets if p.owner == -1 and p.id not in comet_ids)
     few_neutrals = neutrals_left < 4
 
     # ── 4-player: track each enemy's total strength (planets + fleets) ────────
-    enemy_strength: dict[int, float] = {}
+    enemy_strength: dict = {}
     for p in enemy_planets:
         enemy_strength[p.owner] = enemy_strength.get(p.owner, 0.0) + p.ships
     for f in fleets:
         if f.owner not in (-1, player):
             enemy_strength[f.owner] = enemy_strength.get(f.owner, 0.0) + f.ships
     weakest_enemy = min(enemy_strength, key=enemy_strength.get) if enemy_strength else None
+
+    # Elimination mode: weakest enemy has < 40% of our ships — flood them
+    my_total = sum(p.ships for p in my_planets)
+    weakest_ships = enemy_strength.get(weakest_enemy, 9999) if weakest_enemy else 9999
+    elimination_mode = (weakest_ships < my_total * 0.40 and weakest_ships < 150)
 
     friendly_en, hostile_en, third_party_en = _parse_fleets(fleets, player, pid_map, ang_vel)
 
@@ -188,6 +197,8 @@ def _decide(obs):
         if threat <= defense:
             continue
         shortfall = int(threat - defense) + 2
+        # In elimination mode, don't over-invest in defense — stay aggressive
+        reserve_div = 3 if elimination_mode else 2
         allies = sorted(
             [a for a in my_planets if a.id != mine.id and a.id not in source_used],
             key=lambda a: math.hypot(a.x - mine.x, a.y - mine.y)
@@ -195,7 +206,7 @@ def _decide(obs):
         for ally in allies:
             if shortfall <= 0:
                 break
-            sendable = max(0, ally.ships - _reserve(ally.ships, _turn) // 2)
+            sendable = max(0, ally.ships - _reserve(ally.ships, _turn) // reserve_div)
             if sendable < 1:
                 continue
             contrib = min(sendable, shortfall + 5)
@@ -209,7 +220,13 @@ def _decide(obs):
     for mine in my_planets:
         if mine.id in source_used:
             continue
-        base_res = _reserve(mine.ships, _turn) // 2 if behind_on_planets else _reserve(mine.ships, _turn)
+        if elimination_mode:
+            # Half reserve when going for kill
+            base_res = _reserve(mine.ships, _turn) // 3
+        elif behind_on_planets:
+            base_res = _reserve(mine.ships, _turn) // 2
+        else:
+            base_res = _reserve(mine.ships, _turn)
         avail = max(0, mine.ships - base_res)
         if avail < 1:
             continue
@@ -223,28 +240,38 @@ def _decide(obs):
 
             raw_garr = t.ships if t.owner == -1 else t.ships + t.production * eta
             already  = friendly_en.get(t.id, 0) + sending_to.get(t.id, 0)
-            # For enemy planets: subtract confirmed third-party attackers from garrison
             if t.owner not in (-1, player):
                 already += third_party_en.get(t.id, 0)
             net_garr = max(0.0, raw_garr - already)
 
             static_bonus  = 2.5 if _is_static(t) else 1.0
             neutral_bonus = 1.5 if t.owner == -1 else 1.0
+            # Comets: high urgency — they disappear, treat as 2x neutral bonus
+            comet_bonus   = 2.0 if t.id in comet_ids else 1.0
             enemy_bonus   = (3.0 if few_neutrals else 2.0) if t.owner not in (-1, player) else 1.0
             prod_bonus    = 1.6 if (t.owner not in (-1, player) and losing_prod) else 1.0
-            # 4-player: 1.4x bonus for targeting the weakest enemy player
-            weak_bonus    = 1.4 if (t.owner == weakest_enemy) else 1.0
-            # 4-player: 1.5x bonus when a third enemy is already attacking this planet
-            dogpile_bonus = 1.5 if third_party_en.get(t.id, 0) > 0 else 1.0
-            score = (static_bonus * neutral_bonus * enemy_bonus * prod_bonus
-                     * weak_bonus * dogpile_bonus
+            # Elimination: 3x on weakest enemy planets when we're in kill mode
+            elim_bonus    = 3.0 if (elimination_mode and t.owner == weakest_enemy) else 1.0
+            # Standard weak-enemy targeting even outside elimination mode
+            weak_bonus    = 1.4 if (not elimination_mode and t.owner == weakest_enemy) else 1.0
+            # Dogpile: confirmed third-party attacker heading to this enemy planet
+            dogpile_bonus = 1.8 if third_party_en.get(t.id, 0) > 0 else 1.0
+            score = (static_bonus * neutral_bonus * comet_bonus * enemy_bonus
+                     * prod_bonus * elim_bonus * weak_bonus * dogpile_bonus
                      * t.production / (dist * max(net_garr, 1.0)))
             candidates.append((score, mine.id, t.id, eta, tx, ty, net_garr))
 
     candidates.sort(key=lambda c: c[0], reverse=True)
 
-    mine_avail = {p.id: max(0, p.ships - (_reserve(p.ships, _turn) // 2 if behind_on_planets else _reserve(p.ships, _turn)))
-                  for p in my_planets if p.id not in source_used}
+    if elimination_mode:
+        mine_avail = {p.id: max(0, p.ships - _reserve(p.ships, _turn) // 3)
+                      for p in my_planets if p.id not in source_used}
+    elif behind_on_planets:
+        mine_avail = {p.id: max(0, p.ships - _reserve(p.ships, _turn) // 2)
+                      for p in my_planets if p.id not in source_used}
+    else:
+        mine_avail = {p.id: max(0, p.ships - _reserve(p.ships, _turn))
+                      for p in my_planets if p.id not in source_used}
 
     # ── Phase 3: Greedy dispatch ───────────────────────────────────────────────
     for score, mine_id, t_id, eta, tx, ty, _ in candidates:
@@ -256,6 +283,7 @@ def _decide(obs):
 
         t = pid_map[t_id]
         is_neutral = t.owner == -1
+        is_comet   = t.id in comet_ids
 
         already = friendly_en.get(t_id, 0) + sending_to.get(t_id, 0)
         if is_neutral:
@@ -264,7 +292,7 @@ def _decide(obs):
             net_garr = max(0.0, t.ships + t.production * eta - already
                            - third_party_en.get(t_id, 0))
 
-        if is_neutral:
+        if is_neutral or is_comet:
             needed = int(net_garr) + 2
             if net_garr <= 0:
                 continue
@@ -276,10 +304,14 @@ def _decide(obs):
             else:
                 ships_to_send = needed
         else:
-            needed = int(net_garr) + max(8, int(t.production * 6))
+            # In elimination mode, be willing to send more to finish off weak enemy
+            prod_buffer = max(8, int(t.production * 6))
+            if elimination_mode and t.owner == weakest_enemy:
+                prod_buffer = max(4, int(t.production * 3))
+            needed = int(net_garr) + prod_buffer
             if avail >= needed:
                 ships_to_send = needed
-            elif avail >= max(15, int(net_garr * 0.60)) and (losing_prod or few_neutrals):
+            elif avail >= max(15, int(net_garr * 0.60)) and (losing_prod or few_neutrals or elimination_mode):
                 ships_to_send = avail
             else:
                 continue
