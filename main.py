@@ -1,4 +1,4 @@
-﻿"""
+"""
 Orbit Wars - Tier 2 Efficient Expansion Agent  (v12)
 
 Strategy: aggressive expansion with chip attacks, focus-fire weakest/nearest enemy,
