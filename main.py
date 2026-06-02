@@ -1,32 +1,36 @@
 """
-Orbit Wars - Tier 2 Efficient Expansion Agent  (v12)
+Orbit Wars - Tier 2 Efficient Expansion Agent  (v13)
 
-Strategy: aggressive expansion with chip attacks, focus-fire weakest/nearest enemy,
-eliminate players early in 4-player games. Dominant-mode all-in when clearly winning.
+Strategy: aggressive expansion with chip attacks, focus-fire WEAKEST enemy (by total
+ships), eliminate players early in 4-player games. Dominant-mode all-in when winning.
 Prefer frontier enemy planets (isolated, defensible) over deep-cluster targets.
 
-Key design decisions:
-  1. [v12] 4-player focus-fire: always concentrate ALL force on the NEAREST enemy
-     (min-dist from any of our planets to any of their planets). That enemy gets 4x
-     bonus; all other enemies get 0.5x penalty. Prevents the fatal scatter pattern
-     where we split attacks across 3 enemies and let P1 snowball unchecked.
-  2. [v12] Lower elimination_mode threshold 40%→50%, cap 300→400 ships. Triggers
-     focus-fire flood earlier, before the weakest enemy can recover production.
-  3. [v12] Lower stop_leader_bonus threshold 1.5x→1.2x — respond sooner when any
-     enemy outproduces us.
-  4. [v12] 4-player early-game reserve reduction: when four_player and turn < 60,
-     use 1/3 reserve (same as elimination_mode) to maximise expansion speed and
-     match the starter agent's 0%-reserve aggressive early expansion.
-  5. [v11] retake_penalty: penalize enemy targets surrounded by same-owner enemy
-     planets (min_same_enemy_dist / 30, clamped 0.4-1.0). Prevents battle cycling.
-  6. [v11] neutral-first early game: when neutrals_left ≥ 6, enemy_bonus = 1.5.
-  7. [v10] Opportunist scoring: dogpile_bonus 2.5x; snipe_bonus 2x.
-  8. [v10] zero-neutral aggression: enemy_bonus 5x when neutrals_left==0.
-  9. [v9] dominant_mode: ≥3x ships AND ≥1.2x prod → 1/3-reserve + 5x elim_bonus.
- 10. [v8] Phase 4 chip attacks on neutrals we can't yet capture.
- 11. [v7] 4-player metrics: compare against max SINGLE enemy (not combined).
- 12. [v4] Elimination mode flood + comet awareness.
- 13. [v5] Production scoring: prod^1.3.
+Key design decisions (v13 changes from v12):
+  FIX 1. Reverted neutral-first (v11 regression): enemy_bonus is 2.0 when
+     neutrals_left ≥ 4, NOT 1.5. The 1.5 value made us too passive early and let
+     enemies snowball while we expanded into neutrals. v6 used 2.0 and scored 456.6.
+  FIX 2. Reverted elim threshold to v6 values: weakest_ships < my_total*0.40 AND
+     < 300 (v12 used 50%/400 which triggered too early and wasted ships).
+  FIX 3. Softened focus-fire multipliers: focused enemy 4x→3x, non-focus penalty
+     0.5x→0.75x. The 0.5x was too aggressive and caused tunnel vision + missed easy
+     opportunistic targets.
+  IMP 1. Weakest focus-fire target: pick the enemy with LOWEST total ships (not
+     nearest). Consistent with elimination_mode logic — finish off the weakest first.
+  IMP 2. Comet urgency: comet_bonus = 3.0 when eta < 50 (urgent/close), else 2.0.
+     Prioritises immediate comet grabs over distant ones we can't reach in time.
+  IMP 3. Adaptive prod_buffer for enemies: lower buffer when elimination_mode targets
+     weakest enemy (4/3x) or when losing prod (6/4x). More willing to strike when
+     behind, less wasteful of ships when already ahead.
+  IMP 4. Inner planet prioritisation: unclaimed inner orbiting planets with no
+     friendly or incoming fleets get 1.3x boost. Other agents often ignore them.
+
+Retained from v12:
+  - stop_leader_bonus (1.2x threshold, 2x bonus)
+  - 4-player early-game reserve//3 when turn < 60
+  - retake_penalty (0.4–1.0 based on cluster distance)
+  - dominant_mode all-in (3x ships + 1.2x prod)
+  - Phase 4 chip attacks on neutrals
+  - zero-neutral enemy_bonus 5x / few-neutral 3x
 
 Public API
 ----------
@@ -194,7 +198,8 @@ def _decide(obs):
 
     my_total = sum(p.ships for p in my_planets)
     weakest_ships = enemy_strength.get(weakest_enemy, 9999) if weakest_enemy else 9999
-    elimination_mode = (weakest_ships < my_total * 0.50 and weakest_ships < 400)  # [v12] 40%→50%, cap 300→400
+    # [v13-FIX2] reverted to v6 values: 40% / 300 (v12's 50%/400 triggered too early)
+    elimination_mode = (weakest_ships < my_total * 0.40 and weakest_ships < 300)
 
     # dominant_mode: we're clearly winning → go all-in to close the game
     dominant_mode = (
@@ -212,19 +217,13 @@ def _decide(obs):
     # Threat = leader outproducing us by 20%+ in a multi-enemy game  [v12] 1.5→1.2
     leader_is_threat  = len(enemy_pids) > 1 and prod_leader_prod > my_prod * 1.2
 
-    # [v12] 4-player focus-fire: always concentrate on the NEAREST enemy.
-    # Nearest = min distance from any of our planets to any of that enemy's planets.
-    # That enemy gets 4x attack bonus; all others get 0.5x penalty to avoid scatter.
+    # [v13-IMP1] 4-player focus-fire: concentrate on the WEAKEST enemy (by total ships).
+    # Weakest = min total ships across all their planets + fleets.
+    # That enemy gets 3x attack bonus; all others get 0.75x penalty (softened from 0.5x).
     four_player = len(enemy_pids) >= 2
     focused_enemy_4p = None
-    if four_player and enemy_pids:
-        def _nearest_dist(ep_owner):
-            eps = [p for p in enemy_planets if p.owner == ep_owner]
-            if not eps or not my_planets:
-                return float('inf')
-            return min(math.hypot(ep.x - mp.x, ep.y - mp.y)
-                       for ep in eps for mp in my_planets)
-        focused_enemy_4p = min(enemy_pids, key=_nearest_dist)
+    if four_player and enemy_pids and weakest_enemy is not None:
+        focused_enemy_4p = weakest_enemy
 
     friendly_en, hostile_en, third_party_en = _parse_fleets(fleets, player, pid_map, ang_vel)
 
@@ -291,15 +290,18 @@ def _decide(obs):
 
             static_bonus  = 2.5 if _is_static(t) else 1.0
             neutral_bonus = 1.5 if t.owner == -1 else 1.0
-            comet_bonus   = 2.0 if t.id in comet_ids else 1.0
-            # [v11] early-game: don't over-prioritize enemies when neutrals are plentiful
+            # [v13-IMP2] comet urgency: 3x if we can intercept while comet is live (eta<50)
+            if t.id in comet_ids:
+                comet_bonus = 3.0 if eta < 50 else 2.0
+            else:
+                comet_bonus = 1.0
+            # [v13-FIX1] reverted neutral-first: enemy_bonus stays 2.0 when neutrals≥4
+            # (v11/v12 used 1.5 when neutrals≥6, making us too passive vs enemies early)
             if t.owner not in (-1, player):
                 if neutrals_left == 0:
                     enemy_bonus = 5.0
-                elif few_neutrals:
+                elif few_neutrals:   # neutrals_left < 4
                     enemy_bonus = 3.0
-                elif neutrals_left >= 6:
-                    enemy_bonus = 1.5   # equal to neutral_bonus — expand first
                 else:
                     enemy_bonus = 2.0
             else:
@@ -329,19 +331,27 @@ def _decide(obs):
             stop_leader_bonus = (2.0 if (leader_is_threat and t.owner == production_leader
                                          and not elimination_mode and not dominant_mode)
                                  else 1.0)
-            # [v12] 4-player focus-fire: 4x on nearest enemy, 0.5x on all others
+            # [v13-FIX3] softened focus-fire: 3x on weakest enemy (was 4x), 0.75x on others (was 0.5x)
             if four_player and focused_enemy_4p is not None:
                 if t.owner == focused_enemy_4p:
-                    focus_4p = 4.0
+                    focus_4p = 3.0   # concentrate on weakest — still strong bonus
                 elif t.owner not in (-1, player):
-                    focus_4p = 0.5   # penalise non-focus enemies to avoid scatter
+                    focus_4p = 0.75  # soft penalty; don't completely ignore easy picks
                 else:
                     focus_4p = 1.0
             else:
                 focus_4p = 1.0
+            # [v13-IMP4] inner_priority: boost unclaimed inner-orbit planets with no
+            # incoming traffic — other agents often ignore fast-spinning planets
+            if (not _is_static(t) and t.owner == -1
+                    and friendly_en.get(t.id, 0) == 0
+                    and sending_to.get(t.id, 0) == 0):
+                inner_priority = 1.3
+            else:
+                inner_priority = 1.0
             score = (static_bonus * neutral_bonus * comet_bonus * enemy_bonus
                      * prod_bonus * elim_bonus * weak_bonus * dogpile_bonus * snipe_bonus
-                     * retake_penalty * stop_leader_bonus * focus_4p
+                     * retake_penalty * stop_leader_bonus * focus_4p * inner_priority
                      * (t.production ** 1.3) / (dist * max(net_garr, 1.0)))
             candidates.append((score, mine.id, t.id, eta, tx, ty, net_garr, retake_penalty))
 
@@ -392,9 +402,12 @@ def _decide(obs):
             else:
                 continue
         else:
+            # [v13-IMP3] adaptive prod_buffer: lower when elimination_mode or losing prod
             prod_buffer = max(8, int(t.production * 6))
             if elimination_mode and t.owner == weakest_enemy:
-                prod_buffer = max(4, int(t.production * 3))
+                prod_buffer = max(4, int(t.production * 3))   # aggressive vs dying enemy
+            elif losing_prod and t.owner not in (-1, player):
+                prod_buffer = max(6, int(t.production * 4))   # more willing to strike when behind
             needed = int(net_garr) + prod_buffer
             if avail >= needed:
                 ships_to_send = needed
