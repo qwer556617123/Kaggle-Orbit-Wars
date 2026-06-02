@@ -1,30 +1,23 @@
 """
-Orbit Wars - Tier 2 Efficient Expansion Agent  (v13)
+Orbit Wars - Tier 2 Efficient Expansion Agent  (v14)
 
 Strategy: aggressive expansion with chip attacks, focus-fire WEAKEST enemy (by total
 ships), eliminate players early in 4-player games. Dominant-mode all-in when winning.
 Prefer frontier enemy planets (isolated, defensible) over deep-cluster targets.
 
-Key design decisions (v13 changes from v12):
-  FIX 1. Reverted neutral-first (v11 regression): enemy_bonus is 2.0 when
-     neutrals_left ≥ 4, NOT 1.5. The 1.5 value made us too passive early and let
-     enemies snowball while we expanded into neutrals. v6 used 2.0 and scored 456.6.
-  FIX 2. Reverted elim threshold to v6 values: weakest_ships < my_total*0.40 AND
-     < 300 (v12 used 50%/400 which triggered too early and wasted ships).
-  FIX 3. Softened focus-fire multipliers: focused enemy 4x→3x, non-focus penalty
-     0.5x→0.75x. The 0.5x was too aggressive and caused tunnel vision + missed easy
-     opportunistic targets.
-  IMP 1. Weakest focus-fire target: pick the enemy with LOWEST total ships (not
-     nearest). Consistent with elimination_mode logic — finish off the weakest first.
-  IMP 2. Comet urgency: comet_bonus = 3.0 when eta < 50 (urgent/close), else 2.0.
-     Prioritises immediate comet grabs over distant ones we can't reach in time.
-  IMP 3. Adaptive prod_buffer for enemies: lower buffer when elimination_mode targets
-     weakest enemy (4/3x) or when losing prod (6/4x). More willing to strike when
-     behind, less wasteful of ships when already ahead.
-  IMP 4. Inner planet prioritisation: unclaimed inner orbiting planets with no
-     friendly or incoming fleets get 1.3x boost. Other agents often ignore them.
+Key design decisions (v14 changes from v13):
+  FIX A. Removed inner_priority 1.3x boost (IMP 4 from v13). Inner orbiting planets
+     are hard to predict and defend; the 1.3x multiplier was sending fleets to planets
+     that enemies could recapture before we consolidated, wasting ships.
+  FIX B. Reverted comet_bonus to flat 2.0 (removed v13's urgency 3.0 when eta<50).
+     The 3x urgency over-committed ships to comets and left regular planets exposed.
 
-Retained from v12:
+Retained from v13 (regressions fixed + improvements):
+  - FIX 1: enemy_bonus 2.0 (not 1.5) when neutrals_left ≥ 4
+  - FIX 2: elim threshold 40%/300 (not 50%/400)
+  - FIX 3: softened focus-fire 3x/0.75x (not 4x/0.5x)
+  - IMP 1: weakest enemy focus-fire
+  - IMP 3: adaptive prod_buffer (4/3x elim, 6/4x losing_prod)
   - stop_leader_bonus (1.2x threshold, 2x bonus)
   - 4-player early-game reserve//3 when turn < 60
   - retake_penalty (0.4–1.0 based on cluster distance)
@@ -290,11 +283,7 @@ def _decide(obs):
 
             static_bonus  = 2.5 if _is_static(t) else 1.0
             neutral_bonus = 1.5 if t.owner == -1 else 1.0
-            # [v13-IMP2] comet urgency: 3x if we can intercept while comet is live (eta<50)
-            if t.id in comet_ids:
-                comet_bonus = 3.0 if eta < 50 else 2.0
-            else:
-                comet_bonus = 1.0
+            comet_bonus = 2.0 if t.id in comet_ids else 1.0
             # [v13-FIX1] reverted neutral-first: enemy_bonus stays 2.0 when neutrals≥4
             # (v11/v12 used 1.5 when neutrals≥6, making us too passive vs enemies early)
             if t.owner not in (-1, player):
@@ -341,17 +330,9 @@ def _decide(obs):
                     focus_4p = 1.0
             else:
                 focus_4p = 1.0
-            # [v13-IMP4] inner_priority: boost unclaimed inner-orbit planets with no
-            # incoming traffic — other agents often ignore fast-spinning planets
-            if (not _is_static(t) and t.owner == -1
-                    and friendly_en.get(t.id, 0) == 0
-                    and sending_to.get(t.id, 0) == 0):
-                inner_priority = 1.3
-            else:
-                inner_priority = 1.0
             score = (static_bonus * neutral_bonus * comet_bonus * enemy_bonus
                      * prod_bonus * elim_bonus * weak_bonus * dogpile_bonus * snipe_bonus
-                     * retake_penalty * stop_leader_bonus * focus_4p * inner_priority
+                     * retake_penalty * stop_leader_bonus * focus_4p
                      * (t.production ** 1.3) / (dist * max(net_garr, 1.0)))
             candidates.append((score, mine.id, t.id, eta, tx, ty, net_garr, retake_penalty))
 
