@@ -29,6 +29,9 @@ submission*/
 replays/
 logs/
 
+# Local research/reference material
+references/
+
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
