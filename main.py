@@ -1,24 +1,21 @@
 """
-Orbit Wars - Adaptive Campaign + Logistics Guard Agent (v17)
+Orbit Wars - Adaptive Campaign + Counter-Snipe Agent (v18)
 
-Strategy: keep v16's tactical scoring, defense, wave attacks, and logistics guard,
-but add campaign-level choices inspired by stronger public agents: stop expanding
-when neutral ROI is low, avoid captures that are easy to snipe back, concentrate
-multi-planet hammer attacks, and regroup surplus ships toward threatened frontiers.
+Strategy: keep v17's 4-player campaign layer, then add the missing public-agent
+ideas that matter against real opponents: 2-player counter-snipe/anti-snipe and
+hammer hold verification before committing large coordinated attacks.
 
-Key design decisions (v17 changes from v16):
-  NEW A. Strategic stop-expand mode suppresses low-value neutral captures once
-         production share is healthy, the clock is past expansion tempo, or enemy
-         launch tempo says the game has moved into combat.
-  NEW B. Anti-snipe neutral guard rejects captures whose landing surplus is likely
-         to be re-flipped by nearby enemy garrisons within a short response window.
-  NEW C. Hammer attack coordinates up to three sources into one high-value enemy
-         planet during combat/leader-pressure phases.
-  NEW D. Regroup moves surplus rear ships toward owned planets under nearby enemy
-         pressure when no urgent attack consumes them.
+Key design decisions (v18 changes from v17):
+  NEW A. Counter-snipe waits for an enemy to capture a neutral, then cheaply
+         re-flips it after their fleet spends itself.
+  NEW B. 2-player anti-snipe adds buffer or rejects neutral captures that nearby
+         enemy planets can immediately re-take.
+  NEW C. Hammer hold verification rejects large 4-player strikes that are likely
+         to be erased by nearby enemy mass shortly after landing.
 
-Retained from v16:
+Retained from v17:
   - Adaptive modes: TURTLE, BALANCED, AGGRESSIVE, FINAL_PUSH
+  - 4-player stop-expand, hammer, anti-snipe, and regroup campaign layer
   - Wave attack and consolidation for enemy captures
   - Empty-city opportunity detection for drained enemy planets
   - TURTLE frontier filtering
@@ -184,6 +181,46 @@ def _enemy_pressure_at(planet, enemy_planets, horizon=35.0):
             continue
         pressure += ships * (1.0 - d / max(reach, 1.0))
     return pressure
+
+
+def _capture_hold_risk(target, arrival_turn, landing_surplus, enemy_planets, horizon=24.0):
+    """Approximate post-capture pressure from nearby enemy planets."""
+    if arrival_turn <= 0:
+        return False
+    pressure = 0.0
+    for ep in enemy_planets:
+        force = int(ep.ships * 0.45)
+        if force < 10:
+            continue
+        d = math.hypot(ep.x - target.x, ep.y - target.y)
+        eta = d / _speed(force)
+        delay = eta - arrival_turn
+        if delay < 1 or delay > horizon:
+            continue
+        pressure += max(0.0, force - target.production * delay)
+    return pressure > landing_surplus + max(8, target.production * 4)
+
+
+def _counter_snipe_plan(src, target, hostile_en, max_avail, ang_vel):
+    """Plan a cheap re-flip after an enemy fleet captures a neutral."""
+    incoming = hostile_en.get(target.id, 0)
+    if target.owner != -1 or incoming <= target.ships or max_avail < 8:
+        return None
+    enemy_surplus = incoming - target.ships
+    eta, tx, ty = _intercept(src.x, src.y, target, max_avail, ang_vel)
+    if eta < 3 or eta > 28:
+        return None
+    # We do not know exact enemy ETA; assume their current inbound arrives soon.
+    defender = enemy_surplus + target.production * max(1, eta - 2)
+    ships = int(defender) + 2
+    if ships < 8:
+        ships = 8
+    if ships > max_avail or ships > 45:
+        return None
+    eta2, tx2, ty2 = _intercept(src.x, src.y, target, ships, ang_vel)
+    if _hits_sun(src.x, src.y, tx2, ty2):
+        return None
+    return eta2, tx2, ty2, ships
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +579,39 @@ def _decide(obs):
         for pid in list(mine_avail):
             mine_avail[pid] = int(mine_avail[pid] * 0.45)
 
+    # ---- v18 Counter-snipe: let enemy spend, then re-flip cheap neutrals ---
+    if two_player and not logistics_guard and _turn >= 25:
+        counter_options = []
+        for src in my_planets:
+            if src.id in source_used:
+                continue
+            avail = mine_avail.get(src.id, 0)
+            if avail < 12:
+                continue
+            for t in planets:
+                if t.owner != -1 or t.id in comet_ids or sending_to.get(t.id, 0) > 0:
+                    continue
+                plan = _counter_snipe_plan(src, t, hostile_en, avail, ang_vel)
+                if plan is None:
+                    continue
+                eta_c, tx_c, ty_c, ships = plan
+                if ships > max(45, int(avail * 0.75)):
+                    continue
+                score = (t.production ** 1.4) / max(ships * (1 + eta_c / 20), 1)
+                counter_options.append((score, src, t, eta_c, tx_c, ty_c, ships))
+        counter_options.sort(key=lambda x: x[0], reverse=True)
+        used_counter_targets = set()
+        for _, src, t, eta_c, tx_c, ty_c, ships in counter_options[:2]:
+            if src.id in source_used or t.id in used_counter_targets:
+                continue
+            if mine_avail.get(src.id, 0) < ships:
+                continue
+            moves.append([src.id, math.atan2(ty_c - src.y, tx_c - src.x), ships])
+            mine_avail[src.id] = max(0, mine_avail.get(src.id, 0) - ships)
+            source_used.add(src.id)
+            sending_to[t.id] = sending_to.get(t.id, 0) + ships
+            used_counter_targets.add(t.id)
+
     # ---- v17 Hammer: one coordinated high-value enemy strike -------------
     hammer_fired = False
     hammer_ready = (not two_player) and _turn >= 60
@@ -577,6 +647,9 @@ def _decide(obs):
             overkill = 1.18 if two_player else 1.28
             required = int(needed * overkill) + max(8, t.production * 4)
             if total < required:
+                continue
+            landing_surplus = max(0, required - needed)
+            if _capture_hold_risk(t, max_eta, landing_surplus, enemy_planets):
                 continue
             owner_bonus = (
                 2.5 if t.owner == weakest_enemy else
@@ -673,19 +746,17 @@ def _decide(obs):
         if ships_to_send < 1:
             continue
         mine = pid_map[mine_id]
-        if two_player:
-            eta_fire, tx_fire, ty_fire = eta, tx, ty
-        else:
-            eta_fire, tx_fire, ty_fire = _intercept(mine.x, mine.y, t, ships_to_send, ang_vel)
-        if (not two_player) and is_neutral and not is_comet:
+        eta_fire, tx_fire, ty_fire = _intercept(mine.x, mine.y, t, ships_to_send, ang_vel)
+        if is_neutral and not is_comet and (not two_player or (_turn >= 45 and len(my_planets) >= 4)):
             surplus = ships_to_send - net_garr
             if _enemy_retake_risk(t, eta_fire, surplus, enemy_planets):
-                extra = min(avail - ships_to_send, max(0, int(t.production * 5 + 8 - surplus)))
-                if t.production >= 3 and extra > 0:
+                buffer_need = int(t.production * (4 if two_player else 5) + (6 if two_player else 8) - surplus)
+                extra = min(avail - ships_to_send, max(0, buffer_need))
+                if t.production >= (2 if two_player else 3) and extra > 0:
                     ships_to_send += extra
                     eta_fire, tx_fire, ty_fire = _intercept(mine.x, mine.y, t, ships_to_send, ang_vel)
                     surplus = ships_to_send - net_garr
-                if _enemy_retake_risk(t, eta_fire, surplus, enemy_planets):
+                if _enemy_retake_risk(t, eta_fire, surplus, enemy_planets) and (not two_player or t.production <= 2):
                     continue
         if _hits_sun(mine.x, mine.y, tx_fire, ty_fire):
             continue
@@ -705,7 +776,11 @@ def _decide(obs):
 
         # ---- NEW v15: Wave 2 consolidation (enemy targets only, not TURTLE) ----
         if two_player:
-            allow_wave2 = is_enemy and mode != 'TURTLE' and not logistics_guard
+            allow_wave2 = (
+                is_enemy and mode != 'TURTLE' and not logistics_guard
+                and (t.production >= 3 or t.id in empty_city_ids or losing_prod
+                     or few_neutrals or elimination_mode or dominant_mode)
+            )
         else:
             allow_wave2 = (
                 is_enemy and mode != 'TURTLE' and not logistics_guard
