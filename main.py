@@ -1,25 +1,30 @@
 """
-Orbit Wars - Adaptive Behavior + Logistics Guard Agent (v16)
+Orbit Wars - Adaptive Campaign + Logistics Guard Agent (v17)
 
-Strategy: keep v15's adaptive modes, wave attacks, empty-city opportunism, and
-frontier filtering, but add logistics discipline so large launches do not cause
-the agent to misread itself as weak and keep stripping planets thin.
+Strategy: keep v16's tactical scoring, defense, wave attacks, and logistics guard,
+but add campaign-level choices inspired by stronger public agents: stop expanding
+when neutral ROI is low, avoid captures that are easy to snipe back, concentrate
+multi-planet hammer attacks, and regroup surplus ships toward threatened frontiers.
 
-Key design decisions (v16 changes from v15):
-  NEW A. Strategic totals include our fleets in transit. v15 compared enemy
-         planets+fleets against only our planet garrisons, which could falsely
-         trigger AGGRESSIVE mode right after a large launch.
-  NEW B. Logistics guard throttles launches before turn 160 when fleet ships are
-         already high, transit pressure is above 1.6, and average garrison is
-         below 18. While active it reduces available launch ships and disables
-         Wave 2, chip attacks, and relaxed idle-timeout partial attacks.
+Key design decisions (v17 changes from v16):
+  NEW A. Strategic stop-expand mode suppresses low-value neutral captures once
+         production share is healthy, the clock is past expansion tempo, or enemy
+         launch tempo says the game has moved into combat.
+  NEW B. Anti-snipe neutral guard rejects captures whose landing surplus is likely
+         to be re-flipped by nearby enemy garrisons within a short response window.
+  NEW C. Hammer attack coordinates up to three sources into one high-value enemy
+         planet during combat/leader-pressure phases.
+  NEW D. Regroup moves surplus rear ships toward owned planets under nearby enemy
+         pressure when no urgent attack consumes them.
 
-Retained from v15:
+Retained from v16:
   - Adaptive modes: TURTLE, BALANCED, AGGRESSIVE, FINAL_PUSH
   - Wave attack and consolidation for enemy captures
   - Empty-city opportunity detection for drained enemy planets
   - TURTLE frontier filtering
   - 2-turn idle timeout when logistics are healthy
+  - Friendly fleets count toward strategic strength totals
+  - Logistics guard for midgame transit overextension
   - stop_leader_bonus, retake_penalty, dogpile_bonus, snipe_bonus
   - dominant_mode all-in, static_bonus=2.5, production^1.3 scoring
   - Phase 4 chip attacks on neutrals when logistics are healthy
@@ -147,6 +152,40 @@ def _get_reserve(ships, turn, mode, elim=False, dominant=False,
     return base  # BALANCED
 
 
+def _enemy_retake_risk(target, arrival_turn, landing_surplus, enemy_planets):
+    """Approximate whether a neutral capture is easy for enemies to re-flip."""
+    if target.owner != -1 or arrival_turn <= 0:
+        return False
+    for ep in enemy_planets:
+        force = int(ep.ships * 0.45)
+        if force < 8:
+            continue
+        d = math.hypot(ep.x - target.x, ep.y - target.y)
+        eta = d / _speed(force)
+        delay = eta - arrival_turn
+        if delay < 1 or delay > 22:
+            continue
+        defender = landing_surplus + target.production * delay
+        if force > defender + 2:
+            return True
+    return False
+
+
+def _enemy_pressure_at(planet, enemy_planets, horizon=35.0):
+    """Distance-decayed reachable enemy mass around an owned planet."""
+    pressure = 0.0
+    for ep in enemy_planets:
+        ships = max(0, ep.ships)
+        if ships < 5:
+            continue
+        reach = _speed(max(1, int(ships * 0.45))) * horizon
+        d = math.hypot(ep.x - planet.x, ep.y - planet.y)
+        if d >= reach:
+            continue
+        pressure += ships * (1.0 - d / max(reach, 1.0))
+    return pressure
+
+
 # ---------------------------------------------------------------------------
 # Fleet parsing (unchanged from v14)
 # ---------------------------------------------------------------------------
@@ -263,6 +302,25 @@ def _decide(obs):
 
     neutrals_left = sum(1 for p in planets if p.owner == -1 and p.id not in comet_ids)
     few_neutrals  = neutrals_left < 4
+    two_player    = len(enemy_pids) <= 1
+    total_owned_prod = my_prod + sum(enemy_prods)
+    my_prod_share = my_prod / max(total_owned_prod, 1)
+    enemy_launch_sources = {
+        getattr(f, 'from_planet_id', None)
+        for f in fleets
+        if f.owner not in (-1, player) and f.ships >= 20
+    }
+    enemy_tempo = len(enemy_launch_sources) >= 2
+    stop_neutral_expand = (
+        mode != 'FINAL_PUSH'
+        and not losing_prod
+        and not two_player
+        and (
+            (_turn >= 90 and (not two_player))
+            or ((not two_player) and _turn >= 25 and my_prod_share >= 0.35)
+            or ((not two_player) and enemy_tempo and _turn >= 35)
+        )
+    )
 
     # Weakest enemy (by combined ships + fleets) -------------------------
     enemy_strength = {}
@@ -292,6 +350,10 @@ def _decide(obs):
                          if enemy_prod_by_pid else None)
     prod_leader_prod  = enemy_prod_by_pid.get(production_leader, 0)
     leader_is_threat  = len(enemy_pids) > 1 and prod_leader_prod > my_prod * 1.2
+    combat_campaign = (
+        few_neutrals or stop_neutral_expand or losing_prod
+        or leader_is_threat or elimination_mode or dominant_mode
+    )
 
     four_player      = len(enemy_pids) >= 2
     focused_enemy_4p = weakest_enemy if (four_player and weakest_enemy) else None
@@ -397,6 +459,11 @@ def _decide(obs):
 
             static_bonus  = 2.5 if _is_static(t) else 1.0
             neutral_bonus = 1.5 if t.owner == -1 else 1.0
+            if t.owner == -1 and t.id not in comet_ids and stop_neutral_expand:
+                if t.production >= 4 and dist <= 22 and net_garr <= 22:
+                    neutral_bonus = 0.8
+                else:
+                    neutral_bonus = 0.25
             comet_bonus   = 2.0 if t.id in comet_ids else 1.0
 
             # v13-FIX1: enemy_bonus 2.0 when neutrals?? (not 1.5)
@@ -475,9 +542,73 @@ def _decide(obs):
         for pid in list(mine_avail):
             mine_avail[pid] = int(mine_avail[pid] * 0.45)
 
+    # ---- v17 Hammer: one coordinated high-value enemy strike -------------
+    hammer_fired = False
+    hammer_ready = (not two_player) and _turn >= 60
+    if hammer_ready and combat_campaign and not logistics_guard and enemy_planets:
+        hammer_options = []
+        for t in enemy_planets:
+            if t.id in sending_to:
+                continue
+            if t.production < 2 and t.id not in empty_city_ids:
+                continue
+            contributors = []
+            total = 0
+            max_eta = 0.0
+            for p in sorted(my_planets, key=lambda m: math.hypot(m.x - t.x, m.y - t.y)):
+                if p.id in source_used:
+                    continue
+                avail = mine_avail.get(p.id, 0)
+                if avail < 12:
+                    continue
+                sendable = min(avail, max(12, int(avail * 0.70)))
+                eta_h, tx_h, ty_h = _intercept(p.x, p.y, t, sendable, ang_vel)
+                if eta_h > 30 or _hits_sun(p.x, p.y, tx_h, ty_h):
+                    continue
+                contributors.append((eta_h, p, sendable))
+                total += sendable
+                max_eta = max(max_eta, eta_h)
+                if len(contributors) >= 3:
+                    break
+            if len(contributors) < 2:
+                continue
+            already = friendly_en.get(t.id, 0) + sending_to.get(t.id, 0) + third_party_en.get(t.id, 0)
+            needed = max(1, int(t.ships + t.production * max_eta - already))
+            overkill = 1.18 if two_player else 1.28
+            required = int(needed * overkill) + max(8, t.production * 4)
+            if total < required:
+                continue
+            owner_bonus = (
+                2.5 if t.owner == weakest_enemy else
+                2.0 if leader_is_threat and t.owner == production_leader else
+                1.0
+            )
+            empty_bonus = 3.0 if t.id in empty_city_ids else 1.0
+            score = owner_bonus * empty_bonus * (t.production ** 1.5) / max(required * (1 + max_eta / 20), 1)
+            hammer_options.append((score, t, contributors, required))
+
+        if hammer_options:
+            hammer_options.sort(key=lambda x: x[0], reverse=True)
+            _, t, contributors, remaining = hammer_options[0]
+            contributors.sort(key=lambda x: x[0])
+            for _, p, sendable in contributors:
+                if remaining <= 0:
+                    break
+                ships = min(sendable, max(12, remaining))
+                eta_h, tx_h, ty_h = _intercept(p.x, p.y, t, ships, ang_vel)
+                if _hits_sun(p.x, p.y, tx_h, ty_h):
+                    continue
+                angle = math.atan2(ty_h - p.y, tx_h - p.x)
+                moves.append([p.id, angle, ships])
+                mine_avail[p.id] = max(0, mine_avail.get(p.id, 0) - ships)
+                source_used.add(p.id)
+                sending_to[t.id] = sending_to.get(t.id, 0) + ships
+                remaining -= ships
+                hammer_fired = True
+
     # ---- Phase 3: Greedy dispatch + Wave 2 consolidation ----------------
     enemy_dispatched       = set()
-    enemy_dispatched_count = 0   # track for idle-timeout reset
+    enemy_dispatched_count = 1 if hammer_fired else 0   # track for idle-timeout reset
 
     for score, mine_id, t_id, eta, tx, ty, _, retake_p in candidates:
         avail = mine_avail.get(mine_id, 0)
@@ -503,6 +634,9 @@ def _decide(obs):
             needed = int(net_garr) + 2
             if net_garr <= 0:
                 continue
+            if stop_neutral_expand and not is_comet:
+                if t.production < 4 or eta > 20 or net_garr > 22:
+                    continue
             if avail >= needed:
                 ships_to_send = needed
             elif avail > net_garr:
@@ -539,10 +673,24 @@ def _decide(obs):
         if ships_to_send < 1:
             continue
         mine = pid_map[mine_id]
-        if _hits_sun(mine.x, mine.y, tx, ty):
+        if two_player:
+            eta_fire, tx_fire, ty_fire = eta, tx, ty
+        else:
+            eta_fire, tx_fire, ty_fire = _intercept(mine.x, mine.y, t, ships_to_send, ang_vel)
+        if (not two_player) and is_neutral and not is_comet:
+            surplus = ships_to_send - net_garr
+            if _enemy_retake_risk(t, eta_fire, surplus, enemy_planets):
+                extra = min(avail - ships_to_send, max(0, int(t.production * 5 + 8 - surplus)))
+                if t.production >= 3 and extra > 0:
+                    ships_to_send += extra
+                    eta_fire, tx_fire, ty_fire = _intercept(mine.x, mine.y, t, ships_to_send, ang_vel)
+                    surplus = ships_to_send - net_garr
+                if _enemy_retake_risk(t, eta_fire, surplus, enemy_planets):
+                    continue
+        if _hits_sun(mine.x, mine.y, tx_fire, ty_fire):
             continue
 
-        angle = math.atan2(ty - mine.y, tx - mine.x)
+        angle = math.atan2(ty_fire - mine.y, tx_fire - mine.x)
         moves.append([mine_id, angle, ships_to_send])
         sending_to[t_id]      = sending_to.get(t_id, 0) + ships_to_send
         mine_avail[mine_id]  -= ships_to_send
@@ -556,7 +704,16 @@ def _decide(obs):
             source_used.add(mine_id)
 
         # ---- NEW v15: Wave 2 consolidation (enemy targets only, not TURTLE) ----
-        if is_enemy and mode != 'TURTLE' and not logistics_guard:
+        if two_player:
+            allow_wave2 = is_enemy and mode != 'TURTLE' and not logistics_guard
+        else:
+            allow_wave2 = (
+                is_enemy and mode != 'TURTLE' and not logistics_guard
+                and (t.production >= 3 or t.id in empty_city_ids or losing_prod
+                     or elimination_mode or dominant_mode)
+                and retake_p >= 0.55
+            )
+        if allow_wave2:
             w2_candidates = []
             for p2 in my_planets:
                 if p2.id == mine_id or p2.id in source_used:
@@ -575,7 +732,8 @@ def _decide(obs):
                 # Pick earliest-arriving secondary source
                 w2_candidates.sort(key=lambda x: x[0])
                 _, p2, p2_avail, p2_tx, p2_ty = w2_candidates[0]
-                w2_ships = max(10, int(p2_avail * 0.40))   # 40% reinforcement
+                w2_frac = 0.40 if two_player else 0.30
+                w2_ships = max(10, int(p2_avail * w2_frac))
                 w2_angle = math.atan2(p2_ty - p2.y, p2_tx - p2.x)
                 moves.append([p2.id, w2_angle, w2_ships])
                 mine_avail[p2.id]    = max(0, mine_avail.get(p2.id, 0) - w2_ships)
@@ -586,7 +744,7 @@ def _decide(obs):
                     source_used.add(p2.id)
 
     # ---- Phase 4: Chip attacks on neutrals (disabled in TURTLE / FINAL_PUSH) ----
-    if mode not in ('TURTLE', 'FINAL_PUSH') and not logistics_guard:
+    if mode not in ('TURTLE', 'FINAL_PUSH') and not logistics_guard and not stop_neutral_expand:
         chipped_this_turn = set()
         chip_targets = [p for p in planets if p.owner == -1
                         and p.id not in comet_ids and p.production >= 2]
@@ -617,6 +775,42 @@ def _decide(obs):
                 sending_to[t.id]    = sending_to.get(t.id, 0) + chip
                 chipped_this_turn.add(t.id)
                 break   # one chip target per source planet per turn
+
+    # ---- Phase 5: Regroup surplus toward pressured frontiers --------------
+    if not two_player and not logistics_guard and mode != 'FINAL_PUSH' and _turn > 25:
+        pressure = {p.id: _enemy_pressure_at(p, enemy_planets) for p in my_planets}
+        regroup_targets = sorted(
+            [p for p in my_planets if pressure.get(p.id, 0.0) > 18 and p.ships < avg_garrison + 25],
+            key=lambda p: (pressure.get(p.id, 0.0), -p.ships),
+            reverse=True,
+        )
+        regroup_count = 0
+        for target in regroup_targets:
+            if regroup_count >= 2:
+                break
+            desired = max(0, int(avg_garrison + pressure[target.id] * 0.12 - target.ships))
+            if desired < 12:
+                continue
+            sources = sorted(
+                [p for p in my_planets
+                 if p.id != target.id and p.id not in source_used
+                 and mine_avail.get(p.id, 0) >= 35
+                 and pressure.get(p.id, 0.0) + 5 < pressure.get(target.id, 0.0)],
+                key=lambda p: math.hypot(p.x - target.x, p.y - target.y)
+            )
+            for src in sources:
+                avail = mine_avail.get(src.id, 0)
+                send = min(desired, max(12, int(avail * 0.25)), avail - 20)
+                if send < 12:
+                    continue
+                eta_r, tx_r, ty_r = _intercept(src.x, src.y, target, send, ang_vel)
+                if eta_r > 18 or _hits_sun(src.x, src.y, tx_r, ty_r):
+                    continue
+                moves.append([src.id, math.atan2(ty_r - src.y, tx_r - src.x), send])
+                mine_avail[src.id] = max(0, mine_avail.get(src.id, 0) - send)
+                source_used.add(src.id)
+                regroup_count += 1
+                break
 
     # ---- Update idle timeout counter ------------------------------------
     if enemy_dispatched_count > 0:
