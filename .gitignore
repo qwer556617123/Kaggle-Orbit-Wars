@@ -1,5 +1,6 @@
-# Kaggle competition dataset (downloaded data, not source code)
-1.28.0/
+# Kaggle competition datasets / accidental package-version artifacts
+orbit-wars-data/
+1.28.0
 
 # Python
 __pycache__/

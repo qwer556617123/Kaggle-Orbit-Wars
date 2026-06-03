@@ -1,40 +1,28 @@
 """
-Orbit Wars - Adaptive Behavior + Wave Attack Agent  (v15)
+Orbit Wars - Adaptive Behavior + Logistics Guard Agent (v16)
 
-Strategy: adaptive mode selection drives reserve policy and aggression, wave-attack
-coordination pairs a capture fleet with an immediate consolidation fleet, empty-city
-detection opportunistically exploits drained enemy garrisons, and a 2-turn idle
-timeout prevents passive stalling.
+Strategy: keep v15's adaptive modes, wave attacks, empty-city opportunism, and
+frontier filtering, but add logistics discipline so large launches do not cause
+the agent to misread itself as weak and keep stripping planets thin.
 
-Key design decisions (v15 changes from v14):
-  NEW A. Adaptive mode system — four modes computed once per turn:
-           TURTLE     : winning convincingly → conserve, consolidate, frontier only
-           BALANCED   : neutral → v14 behavior
-           AGGRESSIVE : losing → lower reserve, extra enemy_bonus, relax thresholds
-           FINAL_PUSH : turn > 450 → reserve = 0, all-in dispatch
-  NEW B. Wave attack system — after dispatching Wave 1 (capture fleet to enemy T from
-         nearest P1), immediately schedule Wave 2 (consolidation) from best P2 where
-         travel_time(P2→T) ≤ eta_wave1 + 5.  Disabled in TURTLE mode.
-  NEW C. Empty-city opportunity detection — enemy planets with garrison < 15 OR where
-         a large hostile fleet (> 30 ships) just departed (from_planet_id) and current
-         garrison < production * 5.  These targets receive a 10× scoring bonus.
-  NEW D. 2-turn idle timeout — if no enemy dispatch in last 2 turns, prod_buffer is
-         cut 30% and the avail requirement drops to 70% of needed.
-  NEW E. TURTLE frontier filtering — in TURTLE mode only attack the top-3 nearest
-         planets (distance ≤ 25 from any owned planet), sorted by production/distance.
-         Chip attacks disabled in TURTLE mode.
+Key design decisions (v16 changes from v15):
+  NEW A. Strategic totals include our fleets in transit. v15 compared enemy
+         planets+fleets against only our planet garrisons, which could falsely
+         trigger AGGRESSIVE mode right after a large launch.
+  NEW B. Logistics guard throttles launches before turn 160 when fleet ships are
+         already high, transit pressure is above 1.6, and average garrison is
+         below 18. While active it reduces available launch ships and disables
+         Wave 2, chip attacks, and relaxed idle-timeout partial attacks.
 
-Retained from v14 (all regression fixes + improvements preserved):
-  - FIX A: Removed inner_priority 1.3x boost
-  - FIX B: comet_bonus flat 2.0
-  - FIX 1: enemy_bonus 2.0 when neutrals_left ≥ 4
-  - FIX 2: elim threshold 40%/300
-  - FIX 3: softened focus-fire 3x/0.75x
-  - IMP 1: weakest enemy focus-fire
-  - IMP 3: adaptive prod_buffer (4/3x elim, 6/4x losing_prod)
+Retained from v15:
+  - Adaptive modes: TURTLE, BALANCED, AGGRESSIVE, FINAL_PUSH
+  - Wave attack and consolidation for enemy captures
+  - Empty-city opportunity detection for drained enemy planets
+  - TURTLE frontier filtering
+  - 2-turn idle timeout when logistics are healthy
   - stop_leader_bonus, retake_penalty, dogpile_bonus, snipe_bonus
   - dominant_mode all-in, static_bonus=2.5, production^1.3 scoring
-  - Phase 4 chip attacks on neutrals (disabled in TURTLE/FINAL_PUSH)
+  - Phase 4 chip attacks on neutrals when logistics are healthy
 
 Public API
 ----------
@@ -129,10 +117,10 @@ def _assess_mode(my_total, my_prod, enemy_totals, enemy_prods, turn):
     best_enemy_prod  = max(enemy_prods,  default=0)
     if turn > 450:
         return 'FINAL_PUSH'
-    # Comfortably ahead on both ships and production → turtle up and consolidate
+    # Comfortably ahead on both ships and production ??turtle up and consolidate
     if my_total > best_enemy_total * 1.4 and my_prod > best_enemy_prod * 1.1:
         return 'TURTLE'
-    # Meaningfully behind on ships OR outproduced late-game → be aggressive
+    # Meaningfully behind on ships OR outproduced late-game ??be aggressive
     if my_total < best_enemy_total * 0.75 or (my_prod < best_enemy_prod * 0.7 and turn > 100):
         return 'AGGRESSIVE'
     return 'BALANCED'
@@ -168,7 +156,7 @@ def _parse_fleets(fleets, player, pid_map, ang_vel):
 
     friendly:    our fleets  -> planet_id -> ships
     hostile:     all non-us  -> planet_id -> ships
-    third_party: fleets by enemy X heading to enemy Y's planet (X≠Y, X≠player)
+    third_party: fleets by enemy X heading to enemy Y's planet (X?, X?layer)
     """
     friendly, hostile, third_party = {}, {}, {}
     for f in fleets:
@@ -237,7 +225,13 @@ def _decide(obs):
     enemy_pids    = set(p.owner for p in enemy_planets)
 
     # ---- Strength totals ------------------------------------------------
-    my_total      = sum(p.ships for p in my_planets)
+    # Count our fleets too; otherwise large launches make us look falsely weak
+    # and can trigger a self-reinforcing AGGRESSIVE over-extension loop.
+    my_planet_ships = sum(p.ships for p in my_planets)
+    my_fleet_ships  = sum(f.ships for f in fleets if f.owner == player)
+    my_total        = my_planet_ships + my_fleet_ships
+    avg_garrison    = my_planet_ships / max(len(my_planets), 1)
+    transit_pressure = my_fleet_ships / max(my_planet_ships, 1)
     enemy_totals  = [
         sum(p.ships for p in enemy_planets if p.owner == e)
         + sum(f.ships for f in fleets if f.owner == e)
@@ -250,6 +244,13 @@ def _decide(obs):
 
     # ---- Adaptive mode --------------------------------------------------
     mode = _assess_mode(my_total, my_prod, enemy_totals, enemy_prods, _turn)
+    logistics_guard = (
+        _turn < 160
+        and mode != 'FINAL_PUSH'
+        and my_fleet_ships > 80
+        and transit_pressure > 1.6
+        and avg_garrison < 18
+    )
 
     max_enemy_prod    = max(enemy_prods, default=0)
     losing_prod       = max_enemy_prod > my_prod * 1.2
@@ -366,7 +367,7 @@ def _decide(obs):
             moves.append([ally.id, angle, contrib])
             source_used.add(ally.id)
             shortfall -= contrib
-        # Lock defended planet too — prevent Phase 3 from depleting it
+        # Lock defended planet too ??prevent Phase 3 from depleting it
         if shortfall < int(threat - defense) + 2:
             source_used.add(mine.id)
 
@@ -398,7 +399,7 @@ def _decide(obs):
             neutral_bonus = 1.5 if t.owner == -1 else 1.0
             comet_bonus   = 2.0 if t.id in comet_ids else 1.0
 
-            # v13-FIX1: enemy_bonus 2.0 when neutrals≥4 (not 1.5)
+            # v13-FIX1: enemy_bonus 2.0 when neutrals?? (not 1.5)
             if t.owner not in (-1, player):
                 if neutrals_left == 0:
                     enemy_bonus = 5.0
@@ -449,7 +450,7 @@ def _decide(obs):
             else:
                 focus_4p = 1.0
 
-            # NEW v15: empty-city opportunity → 10× bonus
+            # NEW v15: empty-city opportunity ??10? bonus
             empty_city_bonus = 10.0 if t.id in empty_city_ids else 1.0
 
             score = (static_bonus * neutral_bonus * comet_bonus * enemy_bonus
@@ -469,6 +470,10 @@ def _decide(obs):
                            elim=elimination_mode, dominant=dominant_mode,
                            four_p=four_player, behind=behind_on_planets)
         mine_avail[p.id] = max(0, p.ships - res)
+
+    if logistics_guard:
+        for pid in list(mine_avail):
+            mine_avail[pid] = int(mine_avail[pid] * 0.45)
 
     # ---- Phase 3: Greedy dispatch + Wave 2 consolidation ----------------
     enemy_dispatched       = set()
@@ -512,18 +517,19 @@ def _decide(obs):
             elif losing_prod and t.owner not in (-1, player):
                 prod_buffer = max(6, int(t.production * 4))
 
-            # NEW v15: idle timeout — cut prod_buffer 30% if stalled
-            if idle_boost:
+            # NEW v15: idle timeout ??cut prod_buffer 30% if stalled
+            if idle_boost and not logistics_guard:
                 prod_buffer = int(prod_buffer * 0.70)
 
             needed = int(net_garr) + prod_buffer
 
             if avail >= needed:
                 ships_to_send = needed
-            elif idle_boost and avail >= int(needed * 0.70):
+            elif (not logistics_guard) and idle_boost and avail >= int(needed * 0.70):
                 # Idle timeout: accept 70% of needed to break stalemate
                 ships_to_send = avail
             elif avail >= max(10, int(net_garr * 0.40)) and (
+                    not logistics_guard) and (
                     losing_prod or few_neutrals or elimination_mode
                     or dominant_mode or behind_on_planets):
                 ships_to_send = avail
@@ -550,7 +556,7 @@ def _decide(obs):
             source_used.add(mine_id)
 
         # ---- NEW v15: Wave 2 consolidation (enemy targets only, not TURTLE) ----
-        if is_enemy and mode != 'TURTLE':
+        if is_enemy and mode != 'TURTLE' and not logistics_guard:
             w2_candidates = []
             for p2 in my_planets:
                 if p2.id == mine_id or p2.id in source_used:
@@ -580,7 +586,7 @@ def _decide(obs):
                     source_used.add(p2.id)
 
     # ---- Phase 4: Chip attacks on neutrals (disabled in TURTLE / FINAL_PUSH) ----
-    if mode not in ('TURTLE', 'FINAL_PUSH'):
+    if mode not in ('TURTLE', 'FINAL_PUSH') and not logistics_guard:
         chipped_this_turn = set()
         chip_targets = [p for p in planets if p.owner == -1
                         and p.id not in comet_ids and p.production >= 2]
@@ -590,7 +596,7 @@ def _decide(obs):
             if avail < 25:
                 continue
             if hostile_en.get(mine.id, 0) > 0:
-                continue   # planet under threat — keep ships
+                continue   # planet under threat ??keep ships
             for t in sorted(chip_targets,
                             key=lambda n: math.hypot(n.x - mine.x, n.y - mine.y)):
                 already  = sending_to.get(t.id, 0)
