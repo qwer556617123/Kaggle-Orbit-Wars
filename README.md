@@ -161,6 +161,33 @@ def agent(obs):
     return []  # list of [from_planet_id, angle, num_ships]
 ```
 
+## Current Agent Direction
+
+The working fallback in `main.py` is v31/exp34, the current best submitted
+baseline. v34's hybrid risk-punish experiment is archived but rejected after
+public convergence. The previous self-developed best line is archived at
+`archive/agents/v25_guarded_regroup.py`, and the v30 reference baseline is archived at
+`archive/agents/v30_public_reference_ldausl.py`.
+
+The v24 offensive style knobs were disabled after public replays showed worse
+early production and higher transit pressure. v25 remains the best
+self-developed line. v30 is intentionally marked as a public-reference
+calibration candidate rather than a continuation of the v25 heuristic family.
+
+Current best submitted versions to keep for the final submission window:
+
+- `53648046` / `v31 exp34 public reference variant` / public `948.6`
+- `53661855` / `v34 hybrid risk-punish strategy layer` / public `893.5`
+- `53660453` / `v33 exp34 value-weight 5.1` / public `863.1`
+- `53650973` / `v32 exp34 value-weight 5.4` / public `914.3`
+- `53647029` / `v30 public reference calibration baseline` / public `906.1`
+- `53611826` / `v25 guarded regroup rollback` / public `542.2`
+- `53511212` / `v20a mini forecast safe-drain cap` / public `522.3`
+
+Historical replay tools live in `scripts/analyze_replays.py` and
+`scripts/fetch_replays.py`; local gates are in `scripts/evaluate.py`. See
+`docs/strategy.md` for version notes and validation results.
+
 ## Configuration
 
 | Parameter | Default | Description |

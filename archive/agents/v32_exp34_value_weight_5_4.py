@@ -180,7 +180,7 @@ ROT_AWARE_RANK_ENABLED = os.environ.get("V124_ROT_AWARE", "1") != "0"
 
 
 
-VALUE_WEIGHT_2P = 5.2
+VALUE_WEIGHT_2P = float(os.environ.get("V32_VALUE_WEIGHT_2P", "5.4"))
 VALUE_WEIGHT_4P = float(os.environ.get("V126_VALUE_WEIGHT_4P", "2.0"))
 
 

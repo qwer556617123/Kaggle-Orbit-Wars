@@ -180,8 +180,21 @@ ROT_AWARE_RANK_ENABLED = os.environ.get("V124_ROT_AWARE", "1") != "0"
 
 
 
-VALUE_WEIGHT_2P = 5.2
+VALUE_WEIGHT_2P = float(os.environ.get("V34_VALUE_WEIGHT_2P", "5.2"))
 VALUE_WEIGHT_4P = float(os.environ.get("V126_VALUE_WEIGHT_4P", "2.0"))
+
+
+V34_HYBRID_ENABLED = os.environ.get("V34_HYBRID", "1") != "0"
+V34_SAFE_TRANSIT_ENABLED = os.environ.get("V34_SAFE_TRANSIT", "0") != "0"
+V34_DRAINED_PUNISH_ENABLED = os.environ.get("V34_DRAINED_PUNISH", "1") != "0"
+V34_HOLD_FILTER_ENABLED = os.environ.get("V34_HOLD_FILTER", "0") != "0"
+V34_MAX_INFLIGHT_RATIO_OPENING = 0.50
+V34_MAX_INFLIGHT_RATIO_MID = 0.58
+V34_SOURCE_FLOOR_PROD_MULT = 4
+V34_HOLD_HORIZON = 20
+V34_DRAINED_PUNISH_MIN_STEP = 30
+V34_DRAINED_PUNISH_MAX_TRAVEL = 32
+V34_DRAINED_PUNISH_MAX_TARGET_SHIPS = 70
 
 
 
@@ -1328,6 +1341,88 @@ def _depth2_penalty(world, our_action, top_opp_actions=2):
     return worst_delta
 
 
+def _v34_action_score_delta(world, act, spent=None):
+    if not (V34_HYBRID_ENABLED and world.is_2p and world.hybrid_risk is not None):
+        return 0.0
+    src = world.planet_by_id.get(int(act["source_id"]))
+    tgt = world.planet_by_id.get(int(act["target_id"]))
+    if src is None or tgt is None:
+        return None
+    ships = int(act["ships"])
+    turns = int(act["arrival_turn"])
+    if not _v34_launch_allowed(world, src, tgt, ships, turns, spent=spent):
+        return None
+
+    risk = world.hybrid_risk
+    delta = 0.0
+    projected_inflight = (risk.my_fleet_ships + ships) / max(1.0, float(risk.my_total))
+    if V34_SAFE_TRANSIT_ENABLED and tgt.owner == -1:
+        limit = V34_MAX_INFLIGHT_RATIO_OPENING if world.step < 90 else V34_MAX_INFLIGHT_RATIO_MID
+        if risk.style == "HEAVY_ATTACKER":
+            limit -= 0.06
+        if projected_inflight > limit:
+            delta -= (projected_inflight - limit) * 60.0
+
+    if V34_HOLD_FILTER_ENABLED and tgt.owner != world.player:
+        pressure, surplus = _v34_post_capture_pressure(world, tgt, turns, ships)
+        if pressure > surplus:
+            delta -= min(40.0, (pressure - surplus) * 0.45)
+        if risk.style == "SNIPER_RETAKER" and tgt.owner == -1 and pressure > surplus * 0.5:
+            delta -= 6.0
+
+    if risk.style == "FAST_EXPANDER" and tgt.owner == -1 and int(tgt.production) >= 3:
+        delta += 4.0
+    if risk.style == "TURTLER" and world.step >= 75 and tgt.owner not in (-1, world.player):
+        delta += 5.0 + int(tgt.production)
+    if tgt.id in _enemy_recently_launched and tgt.owner not in (-1, world.player):
+        delta += 7.0
+    return delta
+
+
+def _v34_launch_allowed(world, src, tgt, ships, turns, spent=None):
+    if not (V34_HYBRID_ENABLED and world.is_2p and world.hybrid_risk is not None):
+        return True
+    risk = world.hybrid_risk
+    spent_amt = int(spent.get(src.id, 0)) if spent is not None else 0
+
+    if V34_SAFE_TRANSIT_ENABLED:
+        threat = risk.source_threat(world, src.id)
+        floor = max(5, int(src.production) * V34_SOURCE_FLOOR_PROD_MULT + threat + 2)
+        if risk.style == "HEAVY_ATTACKER":
+            floor += 6
+        post = int(src.ships) - spent_amt - int(ships)
+        if post < floor:
+            return False
+        projected_inflight = (risk.my_fleet_ships + int(ships)) / max(1.0, float(risk.my_total))
+        limit = V34_MAX_INFLIGHT_RATIO_OPENING if world.step < 90 else V34_MAX_INFLIGHT_RATIO_MID
+        if risk.style == "HEAVY_ATTACKER":
+            limit -= 0.06
+        if (
+            tgt.owner == -1
+            and projected_inflight > limit + 0.08
+            and int(tgt.production) <= 3
+            and risk.style != "FAST_EXPANDER"
+        ):
+            return False
+
+    if V34_HOLD_FILTER_ENABLED and tgt.owner != world.player:
+        pressure, surplus = _v34_post_capture_pressure(world, tgt, turns, ships)
+        hard_buffer = max(14, int(tgt.production) * 7)
+        if pressure > surplus + hard_buffer:
+            if tgt.owner != -1 or int(tgt.production) <= 3 or risk.style == "SNIPER_RETAKER":
+                return False
+    return True
+
+
+def _v34_post_capture_pressure(world, tgt, turns, ships):
+    owner_at_arrival, defender = predict_defender_at_arrival(world, tgt, turns)
+    if owner_at_arrival == world.player:
+        defender = 0.0
+    surplus = max(0.0, float(ships) - float(defender))
+    pressure = world.hybrid_risk.post_capture_pressure(world, tgt, turns)
+    return pressure, surplus
+
+
 def search_step_action(world, max_per_source=3, max_actions_to_eval=10,
                        use_depth2=False):
     """Depth-1 alpha-beta over step actions.
@@ -1353,6 +1448,10 @@ def search_step_action(world, max_per_source=3, max_actions_to_eval=10,
         gain = act_score - baseline_score
         if apply_decay and gain > 0:
             gain *= 0.97 ** int(act["arrival_turn"])
+        v34_delta = _v34_action_score_delta(world, act)
+        if v34_delta is None:
+            continue
+        gain += v34_delta
         act["score"] = gain
         scored.append(act)
     scored.sort(key=lambda a: (-a["score"], a.get("raw_dist", 0.0)))
@@ -1842,6 +1941,7 @@ class World:
                 if o not in (-1, self.player):
                     self.focus_enemy_2p = o
                     break
+        self.hybrid_risk = HybridRiskState(self) if (V34_HYBRID_ENABLED and self.is_2p) else None
 
     @property
     def num_players(self):
@@ -1987,6 +2087,89 @@ def _record_2p_progress(my_prod_share, intended_patient, reset=False):
             return 0
     _2p_patient_streak += 1
     return _2p_patient_streak
+
+
+class HybridRiskState:
+    """v34 2P strategy sensor used by hybrid gates and punishers."""
+    def __init__(self, world):
+        self.my_planet_ships = sum(int(p.ships) for p in world.my_planets)
+        self.enemy_planet_ships = sum(int(p.ships) for p in world.enemy_planets)
+        self.my_fleet_ships = sum(int(f.ships) for f in world.fleets if f.owner == world.player)
+        self.enemy_fleet_ships = sum(
+            int(f.ships) for f in world.fleets
+            if f.owner != world.player and f.owner != -1
+        )
+        self.my_total = self.my_planet_ships + self.my_fleet_ships
+        self.enemy_total = self.enemy_planet_ships + self.enemy_fleet_ships
+        self.my_inflight_ratio = self.my_fleet_ships / max(1.0, float(self.my_total))
+        self.enemy_inflight_ratio = self.enemy_fleet_ships / max(1.0, float(self.enemy_total))
+        self.my_planet_count = len(world.my_planets)
+        self.enemy_planet_count = len(world.enemy_planets)
+        self.neutral_remaining = sum(
+            1 for p in world.neutral_planets if p.id not in world.comet_ids
+        )
+        self.enemy_neutral_arrivals = 0
+        self.enemy_small_neutral_arrivals = 0
+        self.incoming_to_my = 0
+        for pid, arrs in world.arrivals_by_planet.items():
+            target = world.planet_by_id.get(pid)
+            for eta, owner, ships in arrs:
+                if owner == world.player or owner == -1:
+                    continue
+                if target is not None and target.owner == world.player and eta <= 25:
+                    self.incoming_to_my += int(ships)
+                if target is not None and target.owner == -1 and eta <= 30:
+                    self.enemy_neutral_arrivals += 1
+                    if int(ships) <= 35:
+                        self.enemy_small_neutral_arrivals += 1
+        self.style = self._classify(world)
+
+    def _classify(self, world):
+        my_prod = max(0, int(world.my_prod))
+        enemy_prod = sum(int(p.production) for p in world.enemy_planets)
+        if self.incoming_to_my >= max(25, self.my_planet_ships * 0.20):
+            return "HEAVY_ATTACKER"
+        if self.enemy_inflight_ratio >= 0.34 and self.enemy_fleet_ships >= 30:
+            return "HEAVY_ATTACKER"
+        if self.enemy_neutral_arrivals >= 2 or self.enemy_small_neutral_arrivals >= 1:
+            return "SNIPER_RETAKER"
+        if (
+            world.step <= 85
+            and (self.enemy_planet_count >= self.my_planet_count + 2
+                 or enemy_prod >= my_prod + 4)
+            and self.enemy_inflight_ratio < 0.30
+        ):
+            return "FAST_EXPANDER"
+        avg_enemy_garrison = self.enemy_planet_ships / max(1, self.enemy_planet_count)
+        if world.step >= 70 and self.enemy_inflight_ratio < 0.12 and avg_enemy_garrison >= 45:
+            return "TURTLER"
+        return "UNKNOWN"
+
+    def source_threat(self, world, source_id, horizon=25):
+        return sum(
+            int(ships) for eta, owner, ships
+            in world.arrivals_by_planet.get(source_id, [])
+            if owner != world.player and owner != -1 and int(eta) <= horizon
+        )
+
+    def post_capture_pressure(self, world, target, arrival_turn):
+        pressure = 0.0
+        for ep in world.enemy_planets:
+            if ep.id == target.id:
+                continue
+            force = int(ep.ships * (0.50 if self.style == "SNIPER_RETAKER" else 0.40))
+            if force < 8:
+                continue
+            if safe_geometry(ep.x, ep.y, ep.radius, target.x, target.y, target.radius) is None:
+                continue
+            travel = max(1, int(math.ceil(dist(ep.x, ep.y, target.x, target.y) / fleet_speed(force))))
+            if travel <= arrival_turn:
+                continue
+            delay = travel - int(arrival_turn)
+            if delay > V34_HOLD_HORIZON:
+                continue
+            pressure += max(0.0, force - int(target.production) * delay)
+        return pressure
 
 
 
@@ -3269,6 +3452,10 @@ def _handle_search_expand_4p(world, available, spent, target_locked, moves, mode
                 continue
             if not _neutral_tempo_ok(world, tgt, ships_act, turns_act):
                 continue
+        if tgt is not None and not _v34_launch_allowed(
+                world, world.planet_by_id[src_id], tgt,
+                int(act["ships"]), int(act["arrival_turn"]), spent=spent):
+            continue
         _commit_fleet(world, moves, spent, target_locked,
                       src_id, tgt_id, act["angle"], act["arrival_turn"], act["ships"])
         mode_log[src_id] = "search-expand"
@@ -3353,6 +3540,8 @@ def handle_expand(world, available, spent, target_locked, moves, mode_log):
             if not _endgame_roi_ok(world, tgt, int(ships), turns):
                 continue
             if not _neutral_tempo_ok(world, tgt, int(ships), turns):
+                continue
+            if not _v34_launch_allowed(world, src, tgt, int(ships), turns, spent=spent):
                 continue
             
             
@@ -4703,6 +4892,76 @@ def _build_multiprong_attack(world, target, available, spent, target_locked):
     return final_strength, final_arrival, landings, final_defender
 
 
+def handle_v34_drained_source_punisher(world, available, spent, target_locked, moves, mode_log):
+    if not (
+        V34_HYBRID_ENABLED
+        and V34_DRAINED_PUNISH_ENABLED
+        and world.is_2p
+        and world.hybrid_risk is not None
+        and world.step >= V34_DRAINED_PUNISH_MIN_STEP
+        and _enemy_recently_launched
+    ):
+        return
+    if world.hybrid_risk.my_inflight_ratio > V34_MAX_INFLIGHT_RATIO_MID + 0.08:
+        return
+
+    candidates = []
+    baseline_score = None
+    for tgt_id in list(_enemy_recently_launched):
+        if tgt_id in target_locked:
+            continue
+        tgt = world.planet_by_id.get(tgt_id)
+        if tgt is None or tgt.owner in (-1, world.player):
+            continue
+        if not is_targetable(world, tgt):
+            continue
+        if int(tgt.ships) > V34_DRAINED_PUNISH_MAX_TARGET_SHIPS:
+            continue
+
+        for src in world.my_planets:
+            status = mode_log.get(src.id)
+            if status and status not in ("absorb", "cheap-pickup"):
+                continue
+            avail = available[src.id] - spent[src.id]
+            if avail < MIN_DISPATCH_SHIPS:
+                continue
+            plan = plan_solo_capture(world, src, tgt, avail, V34_DRAINED_PUNISH_MAX_TRAVEL)
+            if plan is None:
+                continue
+            angle, turns, ships = plan
+            if not _v34_launch_allowed(world, src, tgt, ships, turns, spent=spent):
+                continue
+            act = {
+                "target_id": int(tgt.id),
+                "source_id": int(src.id),
+                "angle": float(angle),
+                "arrival_turn": int(turns),
+                "ships": int(ships),
+                "raw_dist": dist(src.x, src.y, tgt.x, tgt.y),
+            }
+            if baseline_score is None:
+                baseline_score = melis_evaluate(world, our_step_action=None)
+            gain = melis_evaluate(world, our_step_action=act) - baseline_score
+            gain += _v34_action_score_delta(world, act, spent=spent) or 0.0
+            tactical = (
+                int(tgt.production) * 5
+                + max(0, 60 - int(tgt.ships)) * 0.4
+                - int(turns) * 0.7
+            )
+            candidates.append((gain + tactical, src, tgt, angle, turns, ships))
+
+    if not candidates:
+        return
+    candidates.sort(key=lambda row: row[0], reverse=True)
+    score, src, tgt, angle, turns, ships = candidates[0]
+    if score < 4.0:
+        return
+    _commit_fleet(world, moves, spent, target_locked,
+                  src.id, tgt.id, angle, turns, int(ships))
+    mode_log[src.id] = "v34-drained-punish"
+    mode_log[tgt.id] = "v34-drained-target"
+
+
 
 
 
@@ -4785,6 +5044,9 @@ def plan_moves(world, deadline=None):
     
     if not _over_budget():
         handle_expand(world, available, spent, target_locked, moves, mode_log)
+
+    if not _over_budget():
+        handle_v34_drained_source_punisher(world, available, spent, target_locked, moves, mode_log)
 
     
     

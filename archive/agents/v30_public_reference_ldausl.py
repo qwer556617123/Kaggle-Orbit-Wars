@@ -29,10 +29,10 @@ SEARCH_EXPAND_4P_ENABLED = True
 SEARCH_EXPAND_2P_ENABLED = True 
 SEARCH_MAX_PER_SOURCE = 3       
 SEARCH_MAX_ACTIONS_TO_PICK = 5    
-SEARCH_MAX_ACTIONS_TO_PICK_2P = 8 
+SEARCH_MAX_ACTIONS_TO_PICK_2P = 7 
 SEARCH_DISABLES_CHEAP_PICKUP = True  
 HAMMER_MELIS_VERIFY = True      
-SEARCH_DEPTH2_ENABLED = False   
+SEARCH_DEPTH2_ENABLED = True   
 
 
 NEUTRAL_CAP_USES_EFFECTIVE_GARRISON = True
@@ -180,7 +180,7 @@ ROT_AWARE_RANK_ENABLED = os.environ.get("V124_ROT_AWARE", "1") != "0"
 
 
 
-VALUE_WEIGHT_2P = 5.2
+VALUE_WEIGHT_2P = 4.86118
 VALUE_WEIGHT_4P = float(os.environ.get("V126_VALUE_WEIGHT_4P", "2.0"))
 
 
@@ -784,7 +784,7 @@ AIM_CONVERGE_DIST = 0.6
 def aim_at_target(src, target, ships, initial_by_id, ang_vel, world=None):
     """Returns (angle, turns) for sending `ships` from src to hit target.
     Iterates orbital prediction. Returns None if the path is blocked by the
-    sun OR if convergence isn't reached — better to skip a target than fire
+    sun OR if convergence isn't reached â€” better to skip a target than fire
     a fleet that wanders past it because our aim didn't settle.
 
     V13.3 Q1: when target is a comet AND world is passed, use comet path for
@@ -793,7 +793,7 @@ def aim_at_target(src, target, ships, initial_by_id, ang_vel, world=None):
     V13.3 R4 (behind-sun wait): if the FIRST estimate fails (current path
     blocked by sun), try aiming at projected future positions of the target
     where the orbital motion may have cleared the path. We launch NOW aiming
-    at where the target WILL be — fleet flies straight, target swings into
+    at where the target WILL be â€” fleet flies straight, target swings into
     place. Better than rejecting the shot entirely."""
     est = estimate_arrival(src.x, src.y, src.radius, target.x, target.y, target.radius, ships)
     if est is None and R4_BEHIND_SUN_WAIT_ENABLED and world is not None:
@@ -855,7 +855,7 @@ def fleet_target_planet(fleet, planets, initial_by_id=None, ang_vel=0.0):
 
     Two-pass: static planets via cheap straight-line intersection, orbital
     planets via per-turn forward simulation. The naive straight-line check
-    against the planet's CURRENT position misses orbital targets — the
+    against the planet's CURRENT position misses orbital targets â€” the
     planet has rotated since the fleet launched, so the ray won't intersect
     its current XY but WILL intersect its future orbital position. Without
     accounting for this, incoming hostile fleets at our orbital planets
@@ -1136,14 +1136,14 @@ def forward_project(world, our_capture_target=None, our_capture_turn=None,
     """Project every planet's owner+ship count forward `horizon` turns.
 
     Inputs:
-      world — current World snapshot.
-      our_capture_target/turn/ships — optional our planned capture (treated
+      world â€” current World snapshot.
+      our_capture_target/turn/ships â€” optional our planned capture (treated
         as a hypothetical friendly fleet arrival).
-      horizon — how many turns to project.
-      project_opponent_moves — if True, each enemy planet launches a fraction
+      horizon â€” how many turns to project.
+      project_opponent_moves â€” if True, each enemy planet launches a fraction
         of its CURRENT surplus toward its closest non-friendly target every
         few turns. Increases accuracy at cost of pessimism for our holdings.
-      opponent_emit_fraction — fraction of surplus the projected launch sends.
+      opponent_emit_fraction â€” fraction of surplus the projected launch sends.
     Returns:
       dict planet_id -> (owner_at_H, ships_at_H).
 
@@ -1288,6 +1288,19 @@ def _depth2_penalty(world, our_action, top_opp_actions=2):
     tgt = world.planet_by_id.get(target_id)
     if tgt is None:
         return 0.0
+
+    # Call forward_project once outside the loop since it only depends on our_action and world
+    proj = forward_project(
+        world,
+        our_capture_target=our_action["target_id"],
+        our_capture_turn=our_action["arrival_turn"],
+        our_capture_ships=our_action["ships"],
+        horizon=FWD_SIM_HORIZON + 6,
+        project_opponent_moves=True,
+        opponent_emit_fraction=0.30,
+    )
+    end_owner, end_ships = proj.get(target_id, (-1, 0))
+
     worst_delta = 0.0
     candidates_evaluated = 0
     for ep in world.planets:
@@ -1305,20 +1318,6 @@ def _depth2_penalty(world, our_action, top_opp_actions=2):
         opp_eta = max(1, int(math.ceil(d / speed)))
         if opp_eta > FWD_SIM_HORIZON + 4:
             continue
-        
-        proj = forward_project(
-            world,
-            our_capture_target=our_action["target_id"],
-            our_capture_turn=our_action["arrival_turn"],
-            our_capture_ships=our_action["ships"],
-            horizon=FWD_SIM_HORIZON + 6,
-            project_opponent_moves=True,
-            opponent_emit_fraction=0.30,
-        )
-        
-        
-        
-        end_owner, end_ships = proj.get(target_id, (-1, 0))
         
         if end_owner != world.player and opp_ships > end_ships:
             worst_delta = min(worst_delta, -opp_ships)
@@ -1369,7 +1368,7 @@ def search_step_action(world, max_per_source=3, max_actions_to_eval=10,
 
 
 def generate_step_actions(world, max_per_source=3):
-    """Generate candidate "step actions" — Melis style. Each step action is
+    """Generate candidate "step actions" â€” Melis style. Each step action is
     a single capture targeting one planet, sourced from one of our planets.
 
     Returns list of dicts: {"target_id", "source_id", "angle", "arrival_turn",
@@ -1431,6 +1430,7 @@ def generate_step_actions(world, max_per_source=3):
                 "ships": int(ships),
                 "raw_dist": float(raw),
             })
+    actions.sort(key=lambda a: (-world.planet_by_id[a["target_id"]].production, a["raw_dist"]))
     return actions
 
 
@@ -1439,14 +1439,14 @@ def melis_evaluate(world, our_step_action=None, horizon=12, future_horizon=8,
     """Melis full-attack-future evaluator.
 
     Inputs:
-      world — current World snapshot.
-      our_step_action — optional dict {"target_id", "arrival_turn", "ships"}.
+      world â€” current World snapshot.
+      our_step_action â€” optional dict {"target_id", "arrival_turn", "ships"}.
         If provided, simulates our planned capture as part of the projection.
-      horizon — short-term sim horizon for our action's effect.
-      future_horizon — additional "all-attack-future" projection turns where
+      horizon â€” short-term sim horizon for our action's effect.
+      future_horizon â€” additional "all-attack-future" projection turns where
         every planet (us + opponents) keeps emitting surplus toward closest
         non-friendly. Captures position quality beyond the immediate move.
-      opp_emit — fraction of surplus opponents launch in projection. 0.30
+      opp_emit â€” fraction of surplus opponents launch in projection. 0.30
         is the calibrated default; lower = more capture-friendly.
 
     Returns: scalar score from our player's POV (higher = better).
@@ -1499,9 +1499,9 @@ def melis_evaluate(world, our_step_action=None, horizon=12, future_horizon=8,
 def forward_score(state, player, n_seats, world=None):
     """Score a forward-projected state from `player`'s POV.
 
-    Combines: ship advantage + 5×planet-count advantage + 8×production advantage.
+    Combines: ship advantage + 5Ã—planet-count advantage + 8Ã—production advantage.
     Weights chosen so an extra owned planet is worth ~5 ships (a typical garrison)
-    and an extra production unit is worth ~8 ships (≈2 turns of growth)."""
+    and an extra production unit is worth ~8 ships (â‰ˆ2 turns of growth)."""
     n_planets = [0] * n_seats
     n_prod = [0] * n_seats
     n_ships = [0] * n_seats
@@ -1923,8 +1923,8 @@ def _detect_mode(world):
     opening since initial expansions look like aggression but aren't.
 
     V12.2 R2: in 2P, sustained PATIENT with no production-share gain forces
-    escalation (10 turns → OPPORTUNISTIC, 20 turns → PRESSURE). This is the
-    Bocsimacko "value action over inaction" principle — patient-vs-patient
+    escalation (10 turns â†’ OPPORTUNISTIC, 20 turns â†’ PRESSURE). This is the
+    Bocsimacko "value action over inaction" principle â€” patient-vs-patient
     1v1 is a stable equilibrium the bot otherwise can't leave.
     """
     if world.is_opening:
@@ -2308,7 +2308,7 @@ def _fwd_my_score(state, player):
 
 
 def _fwd_marginal(world, src_id, angle, ships, player, horizon):
-    """V12.8ay: Δ score (with-launch − without-launch) at horizon."""
+    """V12.8ay: Î” score (with-launch âˆ’ without-launch) at horizon."""
     state_no = _fwd_clone(world)
     _fwd_simulate(state_no, horizon)
     base = _fwd_my_score(state_no, player)
@@ -2346,7 +2346,7 @@ def is_targetable(world, target):
     is already being captured.
 
     V12.9 cap55: enforce the neutral hard cap (2P >=55, 4P legacy) here so
-    every targeting code path obeys it — the previous per-call check at
+    every targeting code path obeys it â€” the previous per-call check at
     generate_step_actions/handle_expand missed cheap-pickup, multiprong, and
     other paths."""
     if target.id in world.comet_ids:
@@ -2385,7 +2385,7 @@ def is_targetable(world, target):
 def _update_neutral_watchlist(world):
     """V12.8c: rebuild the wounded-neutral set from this turn's deltas.
     A neutral that lost >= NEUTRAL_WATCHLIST_MIN_DROP ships since last
-    turn is considered wounded — someone else attacked it, so it's now
+    turn is considered wounded â€” someone else attacked it, so it's now
     cheaper for us to take. _neutral_prev_ships is then refreshed.
 
     V13.3 F1: also track enemy planet ship-drops as 'recently launched'
@@ -2456,7 +2456,7 @@ def _update_neutral_watchlist(world):
 def _neutral_blocked_by_cap(world, target):
     """V12.9 cap55: ignore neutrals with high garrison. V13.3 N4: use
     effective_garrison_at_arrival projection (estimated 10-turn lookahead)
-    so a 60-ship neutral about to be hit by enemy 8 → effective 52 → unblocks."""
+    so a 60-ship neutral about to be hit by enemy 8 â†’ effective 52 â†’ unblocks."""
     if not NEUTRAL_HARD_CAP_ENABLED:
         return False
     if target.owner != -1:
@@ -2543,7 +2543,7 @@ def _endgame_roi_ok(world, target, ships, turns):
 
 
 def friendly_already_committed(world, target_id):
-    """Patient ethos: ONE main fleet per target — UNLESS the target is enemy
+    """Patient ethos: ONE main fleet per target â€” UNLESS the target is enemy
     and our in-flight fleet undershoots its growing garrison.
 
     Neutrals don't grow, so a correctly-sized fleet wins or loses on arrival;
@@ -2726,7 +2726,7 @@ def handle_defense(world, rescue_needs, available, spent, target_locked,
     V14.2 (Phase 3.8): preemptive doom-evac. When total incoming enemy
     ships overwhelm garrison+future_production, the planet is definitely
     doomed even with rescue. Skip rescue (which wastes ships) and evac
-    directly. User-observed scenario: 40 garrison, 10+49 incoming → solo
+    directly. User-observed scenario: 40 garrison, 10+49 incoming â†’ solo
     rescue would send a sub-need fleet and still lose; better to evac.
     """
     if not rescue_needs:
@@ -2865,7 +2865,7 @@ def _try_doom_evac(world, victim, available, spent, target_locked, moves, mode_l
     V14.2 (Phase 3.6, Idea 5): attack-fallback. If no friendly destination,
     try sending the garrison to a winnable enemy/neutral target instead of
     letting the ships die with the planet. Prioritizes enemy planets in
-    _enemy_recently_launched (they just emptied → weakly defended).
+    _enemy_recently_launched (they just emptied â†’ weakly defended).
     """
     if not DOOM_EVAC_ENABLED:
         return False
@@ -3064,7 +3064,7 @@ PREEMPTIVE_EVAC_USE_LARGEST_SINGLE_ENEMY_4P = True
 def handle_comet_evac(world, available, spent, target_locked, moves, mode_log):
     """For each owned comet about to expire, send ALL its ships to the nearest
     non-comet friendly planet (or neutral fallback). Ships left on a comet
-    that exits the system are lost permanently — evacuation preserves them.
+    that exits the system are lost permanently â€” evacuation preserves them.
     """
     if not world.comet_remaining:
         return
@@ -3129,7 +3129,7 @@ def handle_cheap_pickup(world, available, spent, target_locked, moves, mode_log)
     """V12.4d (4P-only): each idle source fires on the cheapest reachable
     low-garrison neutral if it can solo it. Bypasses the K=1 mid-game
     starvation where small free planets sit ignored because the source's
-    K=1 nearest is a higher-garrison target. 4P-only — see CHEAP_PICKUP_4P_ONLY.
+    K=1 nearest is a higher-garrison target. 4P-only â€” see CHEAP_PICKUP_4P_ONLY.
     """
     if not CHEAP_PICKUP_ENABLED:
         return
@@ -3225,14 +3225,15 @@ def _handle_search_expand_4p(world, available, spent, target_locked, moves, mode
     top SEARCH_MAX_ACTIONS_TO_PICK that don't conflict (different targets +
     sources). Returns list of committed source ids so caller can skip them.
     """
+    max_to_pick = SEARCH_MAX_ACTIONS_TO_PICK_2P if world.is_2p else SEARCH_MAX_ACTIONS_TO_PICK
     actions = search_step_action(
         world, max_per_source=SEARCH_MAX_PER_SOURCE,
-        max_actions_to_eval=12,
+        max_actions_to_eval=30,
         use_depth2=SEARCH_DEPTH2_ENABLED,
     )
     committed_sources = set()
     committed_targets = set()
-    for act in actions[:SEARCH_MAX_ACTIONS_TO_PICK * 2]:
+    for act in actions[:max_to_pick * 2]:
         if act["score"] <= 0:
             continue
         src_id = act["source_id"]
@@ -3274,7 +3275,7 @@ def _handle_search_expand_4p(world, available, spent, target_locked, moves, mode
         mode_log[src_id] = "search-expand"
         committed_sources.add(src_id)
         committed_targets.add(tgt_id)
-        if len(committed_sources) >= SEARCH_MAX_ACTIONS_TO_PICK:
+        if len(committed_sources) >= max_to_pick:
             break
     return committed_sources
 
@@ -3397,7 +3398,7 @@ def _effective_target_dist(src, tgt, world):
     Predicts target position at expected travel time and returns distance
     to that future position. Static planets unchanged. Orbital planets
     rotating toward us get a shorter effective distance (promote);
-    rotating away get longer (demote). One-step approximation — cheap;
+    rotating away get longer (demote). One-step approximation â€” cheap;
     real arrival is computed later by aim_at_target inside plan_solo_capture.
     Affects WHICH targets get inspected when K is small, not which fleets fly.
     """
@@ -3420,7 +3421,7 @@ def _effective_target_dist(src, tgt, world):
 def _counter_snipe_candidates(world, src, max_travel, target_locked):
     """V12.4c: neutrals where a known enemy fleet will capture before us, and
     we can re-flip cheaply on a short follow-up. Returns [(target, raw_dist)]
-    sorted by re-flip cost ascending. 2P-only — see COUNTER_SNIPE_2P_ONLY note.
+    sorted by re-flip cost ascending. 2P-only â€” see COUNTER_SNIPE_2P_ONLY note.
     """
     if not COUNTER_SNIPE_ENABLED:
         return []
@@ -3831,7 +3832,7 @@ def _try_coalition_expand(world, src, tgt, max_travel, available, spent,
                           target_locked, moves, mode_log):
     """src can't take tgt alone; find a partner whose combined ships flip it.
     Each contributor must send >= COALITION_MIN_PER_CONTRIBUTOR (no tiny
-    pieces). For tiny targets we DON'T split — the patient ethos prefers
+    pieces). For tiny targets we DON'T split â€” the patient ethos prefers
     waiting for a solo fleet over showering a small target with two halves.
     """
     src_avail = available[src.id] - spent[src.id]
@@ -3977,7 +3978,7 @@ def _brain_pick_lead(world, available, spent, mode_log, min_ships=None):
 
     B3b: when BRAIN_LEAD_PREFER_FRONTIER, score = avail - frontier_dist*weight
     so a frontier planet beats a deep-back-corner one even if the back has
-    slightly more ships — a closer lead delivers strikes faster.
+    slightly more ships â€” a closer lead delivers strikes faster.
     """
     if min_ships is None:
         min_ships = ACCUMULATOR_LEAD_MIN_SHIPS
@@ -4014,9 +4015,9 @@ def _brain_reserve_lead(world, available, spent, mode_log):
     handle_accumulator / handle_mega_hammer run.
 
     Runs after defense (which doesn't gate on mode_log status of sources)
-    and before the expand → accumulator → mega-hammer chain. If defense
+    and before the expand â†’ accumulator â†’ mega-hammer chain. If defense
     later commits the same planet, defense overwrites mode_log[p.id] = 'defense'
-    and the chain naturally skips it — life beats lead."""
+    and the chain naturally skips it â€” life beats lead."""
     if not BRAIN_LEAD_RESERVE_ENABLED:
         return
     if not ACCUMULATOR_ENABLED:
@@ -4053,10 +4054,10 @@ def _brain_reserve_lead(world, available, spent, mode_log):
 
 
 def handle_accumulator(world, available, spent, target_locked, moves, mode_log):
-    """V14.2 (Phase 3.7, Idea 6c): accumulator — feed surplus from safe
+    """V14.2 (Phase 3.7, Idea 6c): accumulator â€” feed surplus from safe
     backline planets to the lead stockpile each turn.
 
-    Engine: fleet speed = 1 + 5×(log(ships)/log(1000))^1.5. One big fleet
+    Engine: fleet speed = 1 + 5Ã—(log(ships)/log(1000))^1.5. One big fleet
     (1000 ships, speed 6) arrives faster AND survives tied-combat better
     than 4 fleets of 250 ships. Concentration > spread.
 
@@ -4150,7 +4151,7 @@ def handle_mega_hammer(world, available, spent, target_locked, moves, mode_log):
     For each of our planets with avail >= MEGA_HAMMER_SHIPS_MIN, find an
     enemy target whose garrison (after projected arrivals) is <=
     MEGA_HAMMER_TARGET_GARRISON_MAX and is within MEGA_HAMMER_MAX_TRAVEL
-    turns. Launch the ENTIRE garrison as a single huge fleet — exploits
+    turns. Launch the ENTIRE garrison as a single huge fleet â€” exploits
     the fleet-speed log formula (bigger = faster) and overwhelms
     reactive defense.
 
@@ -4242,7 +4243,7 @@ def handle_mega_hammer(world, available, spent, target_locked, moves, mode_log):
 def handle_hammer(world, available, spent, target_locked, moves, mode_log):
     """One persistent plan at a time. Plan picks a strong-production enemy
     target and a set of stockpiles whose combined fleet arriving simultaneously
-    beats defender_at_arrival × overkill. Launches stagger so all fleets land
+    beats defender_at_arrival Ã— overkill. Launches stagger so all fleets land
     on the same turn. Plan aborts if defender reinforces past committed strength.
     """
     global _hammer_plan
@@ -4348,7 +4349,7 @@ def _hammer_should_fire(world):
 
 def _build_hammer_plan(world, available, spent):
     """Pick best target + stockpile set. Stockpiles are planets with ships >= MIN
-    or promoted-by-idle. Combined arrival fleet must beat defender × overkill.
+    or promoted-by-idle. Combined arrival fleet must beat defender Ã— overkill.
     Returns plan dict or None."""
     
     
