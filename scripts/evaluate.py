@@ -3,6 +3,7 @@ import importlib.util
 import math
 import os
 import statistics
+import sys
 import time
 from pathlib import Path
 
@@ -17,6 +18,7 @@ SUN_X, SUN_Y, SUN_R = 50.0, 50.0, 10.0
 def load_agent(path):
     spec = importlib.util.spec_from_file_location("orbit_agent", path)
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -51,6 +53,9 @@ def reset_agent_state(mod):
         obj = getattr(mod, name, None)
         if hasattr(obj, "clear"):
             obj.clear()
+    runtime = getattr(mod, "_RUNTIME", None)
+    if runtime is not None and hasattr(runtime, "reset"):
+        runtime.reset()
 
 
 def _g(obs, key, default=None):
@@ -186,6 +191,7 @@ def opponent_from_name(name):
             spec = importlib.util.spec_from_file_location(
                 f"opponent_{len(_OPPONENT_MODULES)}", path)
             mod = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = mod
             spec.loader.exec_module(mod)
             _OPPONENT_MODULES[key] = mod
         return _OPPONENT_MODULES[key].agent

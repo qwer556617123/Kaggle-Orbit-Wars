@@ -106,14 +106,14 @@ def _taxonomy(row):
     return "win_or_unclear" if r == 1 else "unclear_loss"
 
 
-def analyze_file(path, version, team_hint):
+def analyze_file(path, version, team_hint, slot_override=None):
     data = json.loads(path.read_text(encoding="utf-8"))
     steps = data.get("steps") or []
     info = data.get("info") or {}
     rewards = data.get("rewards") or []
     statuses = data.get("statuses") or []
     players = len(steps[0]) if steps else len(rewards)
-    our_slot = _find_our_slot(info, players, team_hint)
+    our_slot = slot_override if slot_override is not None else _find_our_slot(info, players, team_hint)
     opponents = [
         _team_name(info, i) for i in range(players) if i != our_slot
     ]
@@ -149,7 +149,7 @@ def analyze_file(path, version, team_hint):
     return row
 
 
-def collect(paths, team_hint):
+def collect(paths, team_hint, slot_override=None):
     rows = []
     for root in paths:
         root = Path(root)
@@ -159,7 +159,7 @@ def collect(paths, team_hint):
         for path in files:
             try:
                 version = path.parent.name
-                rows.append(analyze_file(path, version, team_hint))
+                rows.append(analyze_file(path, version, team_hint, slot_override=slot_override))
             except Exception as exc:
                 print(f"skip {path}: {exc}")
     return rows
@@ -197,11 +197,12 @@ def print_summary(rows):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("paths", nargs="*", default=["replays/historical"])
-    parser.add_argument("--team", default="Liau")
+    parser.add_argument("--team", default="This cat is called Fumi")
+    parser.add_argument("--slot", type=int, default=None)
     parser.add_argument("--csv", default=None)
     args = parser.parse_args()
 
-    rows = collect(args.paths, args.team)
+    rows = collect(args.paths, args.team, slot_override=args.slot)
     print_summary(rows)
     if args.csv:
         write_csv(rows, args.csv)

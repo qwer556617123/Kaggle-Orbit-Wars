@@ -3,6 +3,350 @@
 This document tracks the current agent direction so code changes can be tied back
 to validation results.
 
+## Current Public Baseline
+
+The active public baseline remains:
+
+```text
+v31 exp34 public reference variant: 948.6
+```
+
+Recent follow-up variants have converged below it:
+
+```text
+v35 production-ordered evaluator window: 897.5
+v34 hybrid risk-punish strategy layer:   893.5
+v33 exp34 value-weight 5.1:              850.4
+```
+
+That means the current problem is not "find a slightly better local reorder."
+The problem is that our local gates still let through changes that disturb the
+public pool's broader matchup mix. Replay-calibrated diagnosis is now the next
+required step before another submission branch.
+
+## v35 Replay Diagnosis
+
+The first public replay comparison between `v31` and `v35` gave a useful
+directional result even though the sample is still small:
+
+```text
+v31 sample taxonomy: early_expansion_loss=7, enemy_snowball=1,
+  failed_focus_fire=1, unclear_loss=1, wins=2/12
+v35 sample taxonomy: early_expansion_loss=5, enemy_snowball=4,
+  wins=3/12
+```
+
+The important point is not the tiny win delta. It is the shape of the losses.
+`v35` reduced some early wipes, but in 2-player games its turn-40 and turn-80
+production was lower on average than `v31`, and those slower openings turned
+into more enemy snowball losses later. The working interpretation is:
+
+1. Globally reordering the 2P evaluator window by target production changed too
+   many opening and early-mid candidate evaluations.
+2. A future retry should keep the original local/short-ETA window as the base
+   and only inject value-biased candidates in narrow pressure states.
+
+## v36 Local Experiment
+
+One follow-up local branch tested that narrower idea: keep `v31` as the base
+window and only blend in a few value-biased 2P candidates when clearly behind
+or when neutrals are nearly exhausted.
+
+Local result:
+
+```text
+starter 2P: 40/40
+starter 4P: 16/16
+public-proxy 2P: 48/48
+vs v25: 30/30
+```
+
+But the longer head-to-head gate failed:
+
+```text
+vs v31, 50 seeds: 23/50 wins, 28/50 firsts
+vs v30, 30 seeds: 13/30 wins
+```
+
+So the branch is rejected locally and `main.py` should stay on the v31
+baseline. The lesson is that even a narrower value-injection window still
+damaged the stable 2P matchups too often once the sample was large enough.
+
+## v36 Public Result: Opening Guard Rejected
+
+v36 avoided touching the 2-player evaluator entirely. The replay sample for
+`v31` suggested the more actionable weakness was 4-player early expansion
+collapse, not 2-player tactical search.
+
+Implementation idea:
+
+1. Keep the `v31` 2P search and timing behavior untouched.
+2. Add a 4P-only opening guard in `plan_solo_capture` for neutral captures.
+3. When a neutral is both early and contested, reject low-production races that
+   nearby enemies can immediately punish.
+4. For the remaining contested openings, run a longer hold check before
+   allowing the capture.
+
+Current local readout:
+
+```text
+starter 2P: 20/20
+starter 4P: 20/20
+public-proxy 2P: 32/32
+vs v31, 2P: 10/20 wins, 13/20 firsts
+vs v31 x3, 4P with guard on:  12/24 wins, 15/32 wins
+vs v31 x3, 4P with guard off: 11/24 wins, 14/32 wins
+```
+
+Public result:
+
+```text
+v36a opening contested neutral guard:      870.1
+v36b opening contested neutral guard wide: 892.2
+v31 exp34 public reference variant:        948.6
+```
+
+Conclusion:
+
+1. `v36b > v36a`, so making the opening guard too strict clearly damages tempo.
+2. Both are below `v31`, so the whole opening neutral guard idea is not strong
+   enough as a public-score direction.
+3. `main.py` should stay on v31 until the next candidate passes a stronger
+   replay-driven gate.
+
+Replay sample after convergence:
+
+```text
+v31:  wins=2/12, avg_rank=2.67,
+      early_expansion_loss=7, enemy_snowball=1,
+      failed_focus_fire=1, unclear_loss=1
+v36a: wins=2/12, avg_rank=2.17,
+      early_expansion_loss=7, enemy_snowball=3
+v36b: wins=2/12, avg_rank=2.58,
+      early_expansion_loss=9, enemy_snowball=1
+```
+
+The split by player count is more revealing:
+
+```text
+v31 4P sample:  t40 prod=12.25, t80 prod=9.00,  early=6/8
+v36a 4P sample: t40 prod=12.75, t80 prod=16.12, early=4/8
+v36b 4P sample: t40 prod=12.45, t80 prod=12.18, early=8/11
+```
+
+v36a did improve some 4P survival/production metrics in the sample, but its
+public score still landed far below v31. That means the guard is not a robust
+score lever by itself. It may be useful later as a very narrow emergency
+condition, but not as a main branch.
+
+The next candidate should move away from broad opening restrictions. Better
+targets are midgame conversion mechanics: 4P leader-bash timing, hammer target
+selection, post-capture reinforcement, or opponent-specific replay clusters.
+
+## v37 Submission: Midgame Conversion
+
+v37 returns to the clean v31 baseline and changes midgame conversion instead of
+opening expansion.
+
+Implementation:
+
+```text
+v37a: leader-aware hammer/mega-hammer retarget
+v37b: v37a plus 4P post-capture consolidation
+```
+
+Local gates:
+
+```text
+v37a starter 2P: 100/100
+v37a starter 4P: 40/40
+v37b starter 2P: 100/100
+v37b starter 4P: 40/40
+v37a vs v31, 4P x3: 15/32 firsts
+v37a with leader targeting off vs v31, 4P x3: 14/32 firsts
+v37b vs v37a, 4P x3: 16/32 firsts
+v37b with consolidation off vs v37a, 4P x3: 13/32 firsts
+v37a vs v31, 2P: 10/20 wins, 13/20 firsts
+v37b public-proxy 2P smoke: 32/32
+```
+
+Submissions:
+
+```text
+53784139: v37a leader-aware hammer retarget, 827.5
+53784138: v37b hammer retarget plus consolidation, 857.4
+```
+
+The local signal did not transfer publicly. The conclusion is that v31 exp34
+small modifications are not a good use of the remaining submission budget.
+
+## v38 Final Attempts: Multi-Focus Baseline
+
+The final two attempts switch to the public Multi-Focus high-score family rather
+than continuing v31 micro-edits. The pulled public notebook describes a
+PyTorch-based planner with predictive movement, exact competitive flow-diff
+scoring, multi-source focus fire, and defensive regrouping.
+
+Local readout before submission:
+
+```text
+v38a vs starter 2P smoke: 4/4
+v38a vs starter 4P smoke: 4/4
+v38a vs v31 2P: 18/20 wins
+v38a vs v31 4P x3: 15/20 firsts
+```
+
+Rejected local variants:
+
+```text
+v38b 4P potential-risk regroup vs v38a: 3/20 wins, 4/20 firsts
+v38c 4P strike4 vs v38a:               3/16 wins, 4/16 firsts
+v38d 4P horizon14 vs v38a:             3/16 wins, 3/16 firsts
+```
+
+Because all tested modifications underperformed the public Multi-Focus baseline,
+the first v38 submissions used the same high-score baseline twice, with the
+second as a public-matchmaking resample:
+
+```text
+53907609: v38a multifocus public high baseline, 1107.3
+53907608: v38e multifocus baseline resample, 887.5
+```
+
+v38a is the current best settled score. The v38e resample confirmed large public
+matchmaking variance, so future candidates must be meaningfully different
+strategy branches rather than tiny local probes.
+
+## v39 Final-Window Large Branches
+
+With two days left, the next attempts prioritize large behavior changes:
+
+- v39f keeps v38a's 4P focus-fire fallback, but expands 2P single-source search
+  from full-drain only to multi-size candidate tiers `(0.5, 0.75, 1.0)`.
+- v39d packages the public Light Intruder dynamic planner as a different
+  public-code-derived architecture: reinforcement-risk sizing, continuous
+  behind/leader adjustment, and late-game candidate suppression.
+
+Local gate:
+
+```text
+v39f py_compile: pass
+v39f starter 2P/4P smoke: 8/8, 8/8
+v39f vs v38a 2P: 11/16 wins, 12/16 firsts
+v39f vs v38a 4P x3: 2/12 wins, 3/12 firsts
+v38a vs v38a 4P x3 baseline: 2/12 wins, 3/12 firsts
+
+v39d py_compile: pass
+v39d starter 2P/4P smoke: 10/10, 8/8
+v39d public-proxy 2P: 32/32
+v39d vs v38a 2P: 7/12 wins, 8/12 firsts
+v39d vs v38a 4P x3: 4/12 wins, 4/12 firsts
+```
+
+Submission:
+
+```text
+53913681: v39f 2p multisize with v38a 4p fallback, 932.1
+53913691: v39d light intruder dynamic baseline, 1006.5
+```
+
+Public conclusion: v39f is rejected. The 2P multi-size search looked strong
+against v38a locally, but public convergence dropped to the low 900s. v39d is
+kept as the second-best settled fallback behind v38a.
+
+## v40 Final-Day Challengers
+
+The final-day policy is one protected fallback slot plus one or two high-risk
+challenger attempts. We do not treat v40 as replacing v38a/v39d unless public
+scores converge higher.
+
+Rejected before submission:
+
+```text
+v40a star-wars LB1224 heuristic vs v38a 2P: 0/8
+v40a star-wars LB1224 heuristic vs v38a 4P x3: 0/6
+v40b heuristic LB1110 vs v38a 2P: 1/8
+v40b heuristic LB1110 vs v38a 4P x3: 1/6
+```
+
+Submitted challengers:
+
+```text
+53943293: v40c im-stronger producer hybrid challenger, 1032.7
+53943297: v40d decision-tree v38a-v39d policy selector, ERROR
+53944332: v40e lazy decision-tree policy selector, ERROR
+53952907: v40f single-file decision-tree selector, 915.7
+```
+
+v40c is a self-contained Producer Hybrid / "I'm Stronger" branch. Local gate:
+
+```text
+starter 2P/4P: 6/6, 6/6
+v40c vs v38a 2P: 5/8 wins
+v40c vs v38a 4P x3: 1/6 wins
+```
+
+Public conclusion: v40c is rejected. It converged near v38a but still below
+the best-settled fallback.
+
+v40d is the small decision-tree attempt requested for the final day. It packages
+v38a and v39d as separate policies. Runtime policy:
+
+```text
+4P: always v38a
+2P: use a depth-3 tree trained on seeds 0..23 from v39d-vs-v38a self-play
+```
+
+The tree only uses opening map features and compiles to hand-written thresholds:
+
+```text
+if neutral_prod <= 59: v38a
+elif nearest_neutral_dist <= 11.2825: v39d
+elif nearest_neutral_ships <= 23.5: v39d
+else: v38a
+```
+
+Local gate:
+
+```text
+selector training positives: 14/24
+selector training accuracy: 0.875
+starter 2P/4P: 8/8, 8/8
+v40d vs v38a 2P: 13/16 wins, 15/16 firsts
+v40d vs v38a 4P x3: 2/8 wins, matching v38a mirror baseline shape
+```
+
+Kaggle validation rejected v40d with submission ERROR. The likely cause is that
+the wrapper imported both large agent files at module import time. v40e keeps
+the same policy tree but lazy-loads only the selected policy after reading the
+initial observation:
+
+```text
+53944332: v40e lazy decision-tree policy selector, ERROR
+v40e starter 2P/4P: 6/6, 6/6
+v40e vs v38a 2P: 9/12 wins, 11/12 firsts
+v40e vs v38a 4P x3: 2/6 wins
+```
+
+v40e also errored, which suggests the Kaggle runner did not accept the
+multi-file/importlib selector pattern. v40f converts the same selector into a
+single-file submission by embedding both v38a and v39d source strings and
+executing them into registered module namespaces. Local behavior is unchanged:
+
+```text
+53952907: v40f single-file decision-tree selector, 915.7
+v40f starter 2P/4P: 4/4, 4/4
+v40f vs v38a 2P: 9/12 wins, 11/12 firsts
+v40f vs v38a 4P x3: 2/6 wins
+```
+
+Final re-submissions for the closing window:
+
+```text
+53983805: final slot v38a multifocus best baseline, pending
+53983816: final slot v40c im-stronger challenger, pending
+```
+
 ## Baselines
 
 - v19 restored the fast 2-player v16/v17 tempo while keeping the 4-player
@@ -334,8 +678,15 @@ but the broader offensive v24 classifier still remains rejected.
 Keep these as the known best pair until a newer candidate converges higher:
 
 ```text
-53611826  v25 guarded regroup rollback       542.2
-53511212  v20a mini forecast safe-drain cap  522.3
+53907609  v38a multifocus public high baseline  1107.3
+53913691  v39d light intruder dynamic baseline   1018.4
+```
+
+Self-developed line reference:
+
+```text
+53611826  v25 guarded regroup rollback           542.2
+53511212  v20a mini forecast safe-drain cap      522.3
 ```
 
 v26 is a useful ablation but not a best-slot candidate:
@@ -457,9 +808,8 @@ v29 is rejected before submission.
 
 ## v30 Public Reference Baseline
 
-The public reference agent from `references/kaggle_notebooks/_extracted` was
-tested as a calibration baseline. It crushes v25 locally and passes our current
-gates:
+A public reference notebook extract was tested as a calibration baseline. It
+crushes v25 locally and passes our current gates:
 
 ```text
 2P starter, 30 seeds: 30/30
@@ -634,3 +984,33 @@ Public result:
 ```
 
 v33 is below v31 and is rejected as a final-window candidate.
+
+## v35 Production-Ordered Candidate Evaluation
+
+v35 keeps the v31/exp34 constants and restores one v30-like structural idea:
+sort generated 2-player step actions by target production before the expensive
+Melis evaluator truncates to the first candidate window. This is not a value
+weight tweak and does not add tactical vetoes; it only changes which generated
+actions get evaluated first.
+
+Local gates:
+
+```text
+py_compile: pass
+2P starter, 100 seeds: 100/100
+4P starter x3, 40 seeds: 40/40
+2P public-proxy, 30 seeds each: 120/120
+v35 vs v31, 50 seeds: 24/50 wins, 29/50 firsts
+v35 vs v30, 50 seeds: 19/50
+v35 vs v25, 30 seeds: 30/30
+```
+
+Decision: submit as a low-intrusion candidate. It is weaker than a clear local
+breakthrough, but unlike v34 it does not add a separate tactical layer and its
+head-to-head result is close enough to v31 to justify one public slot.
+
+Submission:
+
+```text
+53683060  v35 production-ordered evaluator window  PENDING
+```

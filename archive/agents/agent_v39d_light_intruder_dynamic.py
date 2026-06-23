@@ -1,5 +1,4 @@
 
-from __future__ import annotations
 
 
 
@@ -8937,1032 +8936,507 @@ def sparse_action_row_to_moves(
 
 # ==========================================================================
 
-# notebook main.py (ProducerLite runtime + agent)
-
+# ==========================================================================
+# v39 self-contained candidate runtime
+# Source runtime: v39d_light_intruder.py
+# orbit_lite support code embedded from v38a_multifocus_reference.py
 # ==========================================================================
 
 
-
-
-
-
-
 import dataclasses
-
 import os
-
 import sys
+from dataclasses import dataclass, replace
 
-from dataclasses import dataclass
-
-
-
-# Make the sibling ``orbit_lite`` package importable wherever this file runs:
-
-# loaded in place, dropped at a submission-archive root, or exec'd by
-
-# kaggle_environments with no ``__file__`` (fall back to the working dir).
-
+# Make the sibling ``orbit_lite`` package importable wherever this file runs.
 try:
-
     _HERE = os.path.dirname(os.path.abspath(__file__))
-
 except NameError:
-
     _HERE = os.getcwd()
-
 if _HERE not in sys.path:
-
     sys.path.insert(0, _HERE)
 
-
-
 import torch
-
 from torch import Tensor
 
 
 
+TOTAL_STEPS = 500
 
 
-
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-
 class ProducerLiteConfig:
-
-    """Behaviour knobs.  """
-
-
-
-    
-
-    # the projection window, the movement build length, AND the target ETA cap 
-
+    """Minimal config with dynamic-adjustment hooks."""
+    # Planning
     horizon: int = 18
-
-    # --- shortlists ------------------------------------------------------
-
     max_sources_per_lane: int = 12
-
-    max_offensive_targets: int = 12         # enemy/neutral proximity targets
-
-    max_defensive_targets: int = 4          
-
-    # --- scoring / greedy ------------------------------------------------
-
+    max_offensive_targets: int = 12
+    max_defensive_targets: int = 4
     max_waves_per_turn: int = 6
-
-    roi_threshold: float = 1.5              # fire if score > this
-
+    roi_threshold: float = 1.40
     min_ships_to_launch: float = 4.0
-
-    # --- regroup  ------------------------------
-
+    # Reinforcement risk (β)
+    reinforce_size_beta: float = 2.2
+    reinforce_eta_free: float = 3.0
+    reinforce_eta_scale: float = 12.0
+    # Regroup
     enable_regroup: bool = True
-
     max_regroup_time: float = 7.0
-
     regroup_pressure_delta_min: float = 0.25
-
     max_regroup_sources_per_lane: int = 6
-
     max_regroup_targets_per_source: int = 7
-
     regroup_pressure_norm: str = "none"
-
     regroup_time_penalty_weight: float = 1e-3
 
-    # --- potential-attack RISK_SCORE (added to the regroup gradient) -----
 
-    enable_potential_risk: bool = False     # defense feature off by default (no measured gain)
+# ---------------------------------------------------------------------------
+# Dynamic adjustment — single lightweight function
+# ---------------------------------------------------------------------------
 
-    risk_blend_weight: float = 1.0          # weight of RISK added to cheap_enemy_pressure
+def _owner_strength(obs, prod: Tensor, player_count: int) -> Tensor:
+    """Per-owner production + 2.5% ships as strength proxy. [player_count]"""
+    dtype = prod.dtype
+    device = prod.device
+    strength = torch.zeros(int(player_count), dtype=dtype, device=device)
+    owner = obs.owner_abs.to(device=device)
+    alive = obs.alive.to(device=device)
+    ships = obs.ships.to(device=device, dtype=dtype)
+    prod_v = prod.to(device=device, dtype=dtype)
+    for oid in range(int(player_count)):
+        mask = alive & (owner == oid)
+        if bool(mask.any()):
+            strength[oid] = prod_v[mask].sum() + 0.025 * ships[mask].sum()
+    return strength
 
-    risk_enemy_prod_weight: float = 2.0     # enemy strength = ships + w * production
 
-    risk_self_prod_weight: float = 2.0      # own-planet value  = 1 + w * production
+def _adjust_config(
+    config: ProducerLiteConfig,
+    *,
+    obs,
+    prod: Tensor,
+    step: int,
+    player_count: int,
+) -> ProducerLiteConfig:
+    """Continuous dynamic adjustment based on game state.
 
-    risk_support_weight: float = 0.5        # friendly-neighbour discount strength
+    Two knobs:
+      1. Strength-ratio → ROI / waves (continuous, not tiered)
+      2. Time remaining  → suppress late arrivals + devalue late neutrals
+         (applied later in candidate scoring)
+    No hard thresholds, no phase switches — smooth interpolation.
+    """
+    pid = int(obs.player_id)
+    strength = _owner_strength(obs, prod, int(player_count))
+    if pid < 0 or pid >= int(player_count) or strength.numel() == 0:
+        return config
 
-    # --- focus fire (coordinated multi-source attack) -------------------
+    my = float(strength[pid].item())
+    leader = float(strength.max().item())
+    ratio = my / max(leader, 1e-6)  # my_strength / leader_strength
 
-    enable_focus_fire: bool = True          # pool same-step sources to take strong targets
+    # --- ROI: continuous ramp ---
+    #   ratio >= 1.0  → no change (we are leading)
+    #   ratio = 0.80  → ROI - 0.05
+    #   ratio = 0.50  → ROI - 0.15
+    #   ratio = 0.30  → ROI - 0.25
+    if ratio < 1.0:
+        # deficit in [0, 1]: 0 = even, 1 = we have nothing
+        deficit = 1.0 - ratio
+        roi_drop = 0.25 * deficit * deficit  # quadratic: small deficit → small drop
+        new_roi = max(1.10, float(config.roi_threshold) - roi_drop)
+        # Late-game extra push: after step 350, if still behind, drop more
+        remaining = TOTAL_STEPS - int(step)
+        if remaining < 150 and ratio < 0.90:
+            time_urgency = (150 - remaining) / 150.0  # 0→1 as game ends
+            new_roi = max(1.10, new_roi - 0.10 * time_urgency * deficit)
+        config = replace(config, roi_threshold=new_roi)
 
-    max_strike_sources: int = 4             # max planets combined per strike (contributor cap L)
+    # --- Waves: one extra wave when behind or in late game ---
+    base_waves = int(config.max_waves_per_turn)
+    if ratio < 0.70:
+        base_waves = min(7, base_waves + 1)
+    remaining = TOTAL_STEPS - int(step)
+    if remaining < 100 and ratio < 0.95:
+        base_waves = min(7, base_waves + 1)
+    config = replace(config, max_waves_per_turn=base_waves)
+
+    return config
 
 
-
-
+# ---------------------------------------------------------------------------
+# Movement + pressure helpers
+# ---------------------------------------------------------------------------
 
 def _movement_config(config: ProducerLiteConfig, *, player_count: int) -> MovementConfig:
-
-    """MovementConfig: fleet tracking on, horizon = config.horizon."""
-
     return MovementConfig(
-
         movement_horizon=int(config.horizon),
-
         drift_epsilon=1e-3,
-
         track_fleets=True,
-
         player_count=int(player_count),
-
         max_tracked_fleets=128,
-
     )
-
-
-
 
 
 def cheap_enemy_pressure(obs, cache, *, horizon: float, player_id: int) -> Tensor:
-
-    """Cheap reachable-enemy-mass proxy per planet — ``[P]``.
-
-
-
-    Consumed only as the **regroup gradient** (rank owned planets by how stressed
-
-    they are, move ships up the gradient). For each planet ``t``, sums a
-
-    distance-decayed share of every enemy source's **current** garrison that could
-
-    straight-line reach ``t`` within ``horizon`` turns, using the step-0 centre
-
-    distance ``cross_dist[0]``. The decay ``(1 - d/(speed·H))₊`` weights nearer
-
-    enemies more, giving a graded frontline signal in ship-mass units.
-
-
-
-    Approximations: ignores target orbital drift over the horizon, production
-
-    accrued in flight, the per-owner split, and in-flight enemy fleets. Pure
-
-    arithmetic on cached tensors
-
-    """
-
+    """Distance-decayed reachable enemy mass per planet — [P]."""
     P = int(obs.P)
-
     device = obs.device
-
     dtype = obs.ships.dtype
-
     if P == 0:
-
         return torch.zeros(P, dtype=dtype, device=device)
-
-    d0 = cache.cross_dist[0].to(dtype)                                   # [src, tgt] current centre dist
-
+    d0 = cache.cross_dist[0].to(dtype)
     ships = obs.ships.to(dtype)
-
-    speeds = fleet_speed(ships.clamp(min=1e-6))                          # [P]
-
-    reach_dist = (speeds.view(P, 1) * float(horizon)).clamp(min=1e-6)    # [src, 1]
-
-    enemy = obs.alive & (obs.owner_abs >= 0) & (obs.owner_abs != int(player_id))  # [P]
-
+    speeds = fleet_speed(ships.clamp(min=1e-6))
+    reach_dist = (speeds.view(P, 1) * float(horizon)).clamp(min=1e-6)
+    enemy = obs.alive & (obs.owner_abs >= 0) & (obs.owner_abs != int(player_id))
     eye = torch.eye(P, device=device, dtype=torch.bool)
-
-    valid = enemy.view(P, 1) & obs.alive.view(1, P) & ~eye              # [src, tgt]
-
-    decay = (1.0 - d0 / reach_dist).clamp(min=0.0)                       # nearer enemy -> heavier
-
+    valid = enemy.view(P, 1) & obs.alive.view(1, P) & ~eye
+    decay = (1.0 - d0 / reach_dist).clamp(min=0.0)
     contrib = torch.where(valid, ships.view(P, 1) * decay, torch.zeros_like(decay))
-
-    return contrib.sum(dim=0)                                            # [P] summed over sources
-
+    return contrib.sum(dim=0)
 
 
+# ---------------------------------------------------------------------------
+# Late-game candidate suppression
+# ---------------------------------------------------------------------------
 
-
-def potential_attack_risk(obs, cache, *, horizon: float, player_id: int, config) -> Tensor:
-
-    """Precautionary potential-attack RISK_SCORE per planet — ``[P]``.
-
-
-
-    Unlike :func:`cheap_enemy_pressure` (reachable enemy *garrison* mass), this is a
-
-    *precaution* map built from enemy **planets** as potential attackers. For every
-
-    ``(enemy planet e, planet t)`` pair it adds a threat term that grows with the
-
-    enemy's strength (ships + production) and proximity (≈ low straight-line arrival
-
-    time), but is **zeroed when the sun blocks the direct path** ``e→t`` — the engine
-
-    kills fleets whose segment grazes the sun, so such an enemy cannot attack ``t``
-
-    directly (e.g. opposite corners across the centre). RISK(t) is the aggregate over
-
-    all enemy planets, **discounted by friendly support** (nearby owned planets and
-
-    their ships, which can reinforce), and scaled by the planet's own value
-
-    (production). Added into the regroup gradient so leftover ships flow from low-risk
-
-    toward high-risk owned planets.
-
-
-
-    Pure arithmetic on cached tensors (one ``P×P`` pass) — CPU/CUDA agree, no host sync.
-
-    The sun gate is applied to the enemy threat only (reinforcement may route around
-
-    the sun over the horizon, so friendly support is left ungated by design).
-
-    """
-
+def _suppress_late_candidates(
+    *,
+    score: Tensor,
+    obs,
+    target_idx: Tensor,
+    cand_tgt_short: Tensor,
+    cand_is_def: Tensor,
+    cand_eta: Tensor,
+    step: int,
+    player_id: int,
+) -> Tensor:
+    """Suppress attacks that arrive too late; devalue late neutral captures."""
+    remaining = TOTAL_STEPS - int(step)
+    # Only activate in last 120 turns
+    if remaining > 120:
+        return score
     P = int(obs.P)
+    if P <= 0 or score.numel() == 0:
+        return score
+    device = score.device
+    dtype = score.dtype
+    pid = int(player_id)
+    tgt_abs = target_idx[cand_tgt_short].clamp(0, P - 1)
+    tgt_owner = obs.owner_abs.to(device=device)[tgt_abs].long()
+    eta = cand_eta.reshape(score.shape).to(device=device, dtype=dtype)
 
-    device = obs.device
+    is_neutral = tgt_owner < 0
+    is_enemy = (tgt_owner >= 0) & (tgt_owner != pid) & (~cand_is_def)
 
-    dtype = obs.ships.dtype
+    # Too late to matter
+    neutral_margin = max(1.0, float(remaining) - 8.0)
+    enemy_margin = max(1.0, float(remaining) - 4.0)
+    too_late = (is_neutral & (eta > neutral_margin)) | (is_enemy & (eta > enemy_margin))
 
-    if P == 0:
-
-        return torch.zeros(P, dtype=dtype, device=device)
-
-    H = max(float(horizon), 1e-6)
-
-    d0 = cache.cross_dist[0].to(dtype)                                   # [src, tgt] current centre dist
-
-    ships = obs.ships.to(dtype)
-
-    prod = obs.prod.to(dtype)
-
-    speeds = fleet_speed(ships.clamp(min=1e-6))                          # [P] per-source fleet speed
-
-    reach = (speeds.view(P, 1) * H).clamp(min=1e-6)                      # [src, 1] straight-line reach in H
-
-    decay = (1.0 - d0 / reach).clamp(min=0.0)                            # [src, tgt] nearer/faster -> heavier
-
-    eye = torch.eye(P, device=device, dtype=torch.bool)
+    # Late neutrals depreciate — fewer turns to repay launch cost
+    neutral_factor = ((float(remaining) - eta) / max(1.0, 80.0)).clamp(min=0.20, max=1.0)
+    score = torch.where(is_neutral, score * neutral_factor, score)
+    return torch.where(too_late, torch.full_like(score, float("-inf")), score)
 
 
-
-    # --- sun line-of-sight gate: 0 where segment src->tgt grazes the sun --------
-
-    x = obs.x.to(dtype)
-
-    y = obs.y.to(dtype)
-
-    ax = x.view(P, 1); ay = y.view(P, 1)                                 # src endpoint  [src,1]
-
-    bx = x.view(1, P); by = y.view(1, P)                                 # tgt endpoint  [1,tgt]
-
-    abx = bx - ax; aby = by - ay                                         # [src, tgt]
-
-    denom = (abx * abx + aby * aby).clamp(min=1e-12)
-
-    u = (((CENTER - ax) * abx + (CENTER - ay) * aby) / denom).clamp(0.0, 1.0)
-
-    cx = ax + u * abx; cy = ay + u * aby                                 # closest point on segment to centre
-
-    sun_dist = torch.sqrt(((cx - CENTER) ** 2 + (cy - CENTER) ** 2).clamp(min=0.0))
-
-    los_clear = (sun_dist >= float(SUN_RADIUS)).to(dtype)               # [src, tgt] 1 = unobstructed
-
-
-
-    # --- aggregated enemy-planet threat on each target -------------------------
-
-    enemy = obs.alive & (obs.owner_abs >= 0) & (obs.owner_abs != int(player_id))  # [P]
-
-    strength = ships + float(config.risk_enemy_prod_weight) * prod      # [P] per enemy source
-
-    valid_e = enemy.view(P, 1) & obs.alive.view(1, P) & ~eye            # [src, tgt]
-
-    threat = torch.where(valid_e, strength.view(P, 1) * decay * los_clear, torch.zeros_like(decay))
-
-    enemy_threat = threat.sum(dim=0)                                    # [tgt] summed over enemy planets
-
-
-
-    # --- friendly support discount (own neighbours + their ships) --------------
-
-    own = obs.owned & obs.alive                                         # [P]
-
-    valid_o = own.view(P, 1) & obs.alive.view(1, P) & ~eye             # [neighbour, tgt]
-
-    support = torch.where(
-
-        valid_o, (1.0 + ships).view(P, 1) * decay, torch.zeros_like(decay)
-
-    ).sum(dim=0)                                                       # [tgt]
-
-
-
-    value = 1.0 + float(config.risk_self_prod_weight) * prod           # [tgt] own-planet worth
-
-    return value * enemy_threat / (1.0 + float(config.risk_support_weight) * support)  # [P]
-
-
-
-
+# ---------------------------------------------------------------------------
+# Core planner
+# ---------------------------------------------------------------------------
 
 def plan_lite_waves(
-
     *,
-
     movement: PlanetMovement,
-
     obs,
-
     obs_tensors: dict,
-
     cache,
-
     garrison_status,
-
     prod: Tensor,
-
     alive_by_step: Tensor,
-
     config: ProducerLiteConfig,
-
     player_count: int,
-
 ):
-
-    """Single-size, single-source attack planner + regroup.
-
-
-
-    Builds exactly one candidate per ``(source, target)`` shortlist pair — fleet
-
-    size = the source's max garrison launch (``safe_drain``) — scores them with the
-
-    exact competitive flow diff, and greedily fires the best wave per target up to
-
-    ``max_waves_per_turn``. Returns the combined ``LaunchEntries`` (attack waves ++
-
-    regroup).
-
-    """
-
+    """Single-size attack planner + regroup. One candidate per (source, target)."""
     P = obs.P
-
     device = obs.device
-
     dtype = obs.ships.dtype
-
     pid = int(obs.player_id)
-
-
+    step = int(obs_tensors["step"].reshape(-1)[0].item())
 
     H_axis = int(garrison_status.ships.shape[-1])
-
     H = max(H_axis - 1, 0)
-
     K_eta = max(1, min(int(config.horizon), H))
-
     W = max(1, int(config.max_waves_per_turn))
 
-
-
     source_mask = obs.owned & obs.alive & (obs.ships >= float(config.min_ships_to_launch))
-
     if not bool(source_mask.any()):
-
         return _empty_entries(device, dtype)
-
-
 
     S_cap = max(1, min(int(config.max_sources_per_lane), P))
-
     source_idx, source_exists = _candidate_indices(obs.ships, source_mask, S_cap)
-
     target_idx, target_exists = build_target_shortlist(
-
         obs, obs_tensors, garrison_status, cache,
-
         config=config, K_eta=K_eta, H=H, prod=prod, source_mask=source_mask,
+    )
+    if not bool(target_exists.any()):
+        return _empty_entries(device, dtype)
+    S = int(source_idx.shape[0])
+    T = int(target_idx.shape[0])
+    target_is_mine = obs.owned[target_idx.clamp(0, P - 1)]
 
+    source_ships = obs.ships[source_idx.clamp(0, P - 1)].to(dtype)
+    H_eff = torch.full((), float(H), dtype=dtype, device=device)
+    drain = safe_drain(
+        garrison_status, source_idx=source_idx, source_ships=source_ships,
+        H_eff=H_eff, player_id=pid,
     )
 
-    if not bool(target_exists.any()):
+    eta_cap = torch.full((T,), float(K_eta), dtype=dtype, device=device)
 
-        return _empty_entries(device, dtype)
+    # Enemy pressure — reused for β floor and regroup
+    beta = float(config.reinforce_size_beta)
+    enemy_mass = (
+        cheap_enemy_pressure(obs, cache, horizon=float(K_eta), player_id=pid)
+        if beta > 0.0 or bool(config.enable_regroup) else None
+    )
 
-    S = int(source_idx.shape[0])
-
-    T = int(target_idx.shape[0])
-
-    target_is_mine = obs.owned[target_idx.clamp(0, P - 1)]                       # [T]
-
-
-
-    source_ships = obs.ships[source_idx.clamp(0, P - 1)].to(dtype)                # [S]
-
-    H_eff = torch.full((), float(H), dtype=dtype, device=device)
-
-    drain = safe_drain(
-
-        garrison_status, source_idx=source_idx, source_ships=source_ships,
-
-        H_eff=H_eff, player_id=pid,
-
-    )                                                                            # [S]
-
-
-
-    # Uniform reach cap = K_eta (= horizon).
-
-    eta_cap = torch.full((T,), float(K_eta), dtype=dtype, device=device)          # [T]
-
-
-
+    # Reinforcement risk floor
+    reinforcement = None
+    if beta > 0.0:
+        enemy_mass_t = enemy_mass[target_idx.clamp(0, P - 1)]
+        k_arange = torch.arange(1, K_eta + 1, device=device, dtype=dtype)
+        rho = reinforcement_timing_factor(
+            k_arange, eta_free=float(config.reinforce_eta_free),
+            eta_scale=float(config.reinforce_eta_scale),
+        )
+        reinforcement = beta * rho.view(1, K_eta) * enemy_mass_t.view(T, 1)
     floor = capture_floor(
-
         garrison_status, target_idx=target_idx, k_max=K_eta,
-
         capture_overhead=1.0, player_id=pid,
-
-    )                                                                            # [T, K]
-
+        reinforcement=reinforcement,
+    )
     K = int(floor.shape[-1])
 
-
-
-    # --- single fleet size = the max garrison launch (safe_drain) ---------------
-
-    # Engine needs integer ship counts; floor (never exceed what's available).
-
-    sizes = drain.view(S, 1).expand(S, T).floor()                                # [S, T]
-
-
-
-    # Strict-superset reachability precheck (always on): defers the body screen to
-
-    # candidates that can physically reach the target in time.
+    # Single size = safe_drain (full garrison launch)
+    sizes = drain.view(S, 1).expand(S, T).floor().clamp(min=1.0)
 
     active = reachable_mask(
-
         movement, source_idx=source_idx, target_idx=target_idx,
-
         fleet_sizes=sizes.unsqueeze(-1), eta_cap=eta_cap,
-
-    ).squeeze(-1)                                                                # [S, T]
-
+    ).squeeze(-1)
     aim = intercept_angle(
-
         movement,
-
-        source_idx.unsqueeze(1),                                                 # [S, 1]
-
-        target_idx.unsqueeze(0),                                                 # [1, T]
-
-        sizes,                                                                    # [S, T]
-
+        source_idx.unsqueeze(1),
+        target_idx.unsqueeze(0),
+        sizes,
         active=active,
-
     )
-
-    angle = aim["angle"]                                                         # [S, T]
-
+    angle = aim["angle"]
     eta = aim["eta"]
-
     viable = aim["viable"] & (eta <= eta_cap.view(1, T))
 
-
-
-    # Capture-floor gate at each fleet's arrival turn (defenders grow with k). The
-
-    # single size must clear the defender it lands on (size >= floor_at_arr). Owned
-
-    # targets have floor 1 (reinforcement), so any positive send clears.
-
     if K > 0:
-
-        k_arr = (eta.clamp(min=1.0, max=float(K)).ceil().long() - 1).clamp(0, K - 1)  # [S,T]
-
+        k_arr = (eta.clamp(min=1.0, max=float(K)).ceil().long() - 1).clamp(0, K - 1)
         floor_at_arr = floor.unsqueeze(0).expand(S, T, K).gather(-1, k_arr.unsqueeze(-1)).squeeze(-1)
-
     else:
-
         floor_at_arr = torch.ones(S, T, dtype=dtype, device=device)
-
-    clears_floor = sizes >= floor_at_arr                                         # [S, T]
-
-
+    clears_floor = sizes >= floor_at_arr
 
     src_neq_tgt = source_idx.view(S, 1) != target_idx.view(1, T)
-
     valid = (
-
-        viable & clears_floor & (sizes >= 1.0) & src_neq_tgt
-
-        & source_exists.view(S, 1) & target_exists.view(1, T)
-
-    )                                                                            # [S, T]
-
-
-
-    if not bool(config.enable_focus_fire):
-
-        # --- original: one single-source candidate per (source, target); L = 1 ----
-
-        L = 1
-
-        C = S * T
-
-        cand_src = source_idx.view(S, 1).expand(S, T).reshape(C, L)
-
-        cand_tgt_slot = target_idx.view(1, T).expand(S, T).reshape(C)
-
-        cand_tgt_short = torch.arange(T, device=device).view(1, T).expand(S, T).reshape(C)
-
-        cand_send = torch.where(valid, sizes, torch.zeros_like(sizes)).reshape(C, L)
-
-        cand_angle = angle.reshape(C, L)
-
-        cand_eta = torch.where(valid, eta, torch.ones_like(eta)).reshape(C, L)
-
-        cand_active = valid.reshape(C, L)
-
-        cand_valid = valid.reshape(C)
-
-    else:
-
-        # --- focus fire: single-source candidates (widened to L) ++ pooled, same-
-
-        # step multi-source strikes that combine to clear strong targets no single
-
-        # planet can take. Contributors sharing ceil(eta) land together, and the
-
-        # flow-diff sums them vs the defender at that step. Strictly additive: the
-
-        # single-source slot-0 scores are identical to the original path.
-
-        L = max(1, int(config.max_strike_sources))
-
-        ST = S * T
-
-        ss_src = torch.zeros(ST, L, dtype=torch.long, device=device)
-
-        ss_src[:, 0] = source_idx.view(S, 1).expand(S, T).reshape(-1)
-
-        ss_send = torch.zeros(ST, L, dtype=dtype, device=device)
-
-        ss_send[:, 0] = torch.where(valid, sizes, torch.zeros_like(sizes)).reshape(-1)
-
-        ss_angle = torch.zeros(ST, L, dtype=dtype, device=device)
-
-        ss_angle[:, 0] = angle.reshape(-1)
-
-        ss_eta = torch.ones(ST, L, dtype=dtype, device=device)
-
-        ss_eta[:, 0] = torch.where(valid, eta, torch.ones_like(eta)).reshape(-1)
-
-        ss_active = torch.zeros(ST, L, dtype=torch.bool, device=device)
-
-        ss_active[:, 0] = valid.reshape(-1)
-
-        ss_tgt_slot = target_idx.view(1, T).expand(S, T).reshape(-1)
-
-        ss_tgt_short = torch.arange(T, device=device).view(1, T).expand(S, T).reshape(-1)
-
-        ss_valid = valid.reshape(-1)
-
-
-
-        # Pooled strikes on offensive (non-owned) targets: group eligible sources by
-
-        # arrival step, take the minimal drain-desc prefix (>=2) that clears the floor.
-
-        eligible = (
-
-            viable & (sizes >= 1.0) & src_neq_tgt
-
-            & source_exists.view(S, 1) & target_exists.view(1, T)
-
-        )                                                                        # [S, T] (no single-source clears_floor)
-
-        step_arr = eta.clamp(min=1.0, max=float(K_eta)).ceil().long()            # [S, T] arrival step
-
-        pooled = []   # list of (target_short_idx, source_rows[:j])
-
-        if L >= 2 and K > 0:
-
-            for t in range(T):
-
-                if bool(target_is_mine[t]):
-
-                    continue
-
-                rows = torch.nonzero(eligible[:, t], as_tuple=False).flatten()
-
-                if int(rows.numel()) < 2:
-
-                    continue
-
-                steps_t = step_arr[rows, t]
-
-                for k in torch.unique(steps_t).tolist():
-
-                    k = int(k)
-
-                    if k < 1 or (k - 1) >= K:
-
-                        continue
-
-                    grp = rows[steps_t == k]
-
-                    if int(grp.numel()) < 2:
-
-                        continue
-
-                    gd = sizes[grp, t]
-
-                    order = torch.argsort(gd, descending=True, stable=True)
-
-                    grp = grp[order]
-
-                    csum = torch.cumsum(gd[order], dim=0)
-
-                    need = floor[t, k - 1]
-
-                    hit = torch.nonzero(csum >= need, as_tuple=False)
-
-                    if int(hit.numel()) == 0:
-
-                        continue                                                  # group can't clear even combined
-
-                    j = int(hit[0].item()) + 1                                    # minimal sufficient prefix
-
-                    if j < 2 or j > L:
-
-                        continue                                                  # j==1 already covered single-source
-
-                    pooled.append((t, grp[:j]))
-
-
-
-        if pooled:
-
-            C2 = len(pooled)
-
-            p_src = torch.zeros(C2, L, dtype=torch.long, device=device)
-
-            p_send = torch.zeros(C2, L, dtype=dtype, device=device)
-
-            p_angle = torch.zeros(C2, L, dtype=dtype, device=device)
-
-            p_eta = torch.ones(C2, L, dtype=dtype, device=device)
-
-            p_active = torch.zeros(C2, L, dtype=torch.bool, device=device)
-
-            p_tgt_slot = torch.zeros(C2, dtype=torch.long, device=device)
-
-            p_tgt_short = torch.zeros(C2, dtype=torch.long, device=device)
-
-            for i, (t, grp) in enumerate(pooled):
-
-                j = int(grp.numel())
-
-                p_src[i, :j] = source_idx[grp]
-
-                p_send[i, :j] = sizes[grp, t]
-
-                p_angle[i, :j] = angle[grp, t]
-
-                p_eta[i, :j] = eta[grp, t]
-
-                p_active[i, :j] = True
-
-                p_tgt_slot[i] = target_idx[t]
-
-                p_tgt_short[i] = t
-
-            cand_src = torch.cat([ss_src, p_src], dim=0)
-
-            cand_send = torch.cat([ss_send, p_send], dim=0)
-
-            cand_angle = torch.cat([ss_angle, p_angle], dim=0)
-
-            cand_eta = torch.cat([ss_eta, p_eta], dim=0)
-
-            cand_active = torch.cat([ss_active, p_active], dim=0)
-
-            cand_tgt_slot = torch.cat([ss_tgt_slot, p_tgt_slot], dim=0)
-
-            cand_tgt_short = torch.cat([ss_tgt_short, p_tgt_short], dim=0)
-
-            cand_valid = torch.cat(
-
-                [ss_valid, torch.ones(C2, dtype=torch.bool, device=device)], dim=0
-
-            )
-
-        else:
-
-            cand_src, cand_send, cand_angle = ss_src, ss_send, ss_angle
-
-            cand_eta, cand_active = ss_eta, ss_active
-
-            cand_tgt_slot, cand_tgt_short, cand_valid = ss_tgt_slot, ss_tgt_short, ss_valid
-
-        C = int(cand_src.shape[0])
-
-
-
-    cand_is_def = target_is_mine[cand_tgt_short]                                  # [C]
-
-
-
-    launches = make_launch_set(
-
-        source_slots=cand_src,
-
-        target_slots=cand_tgt_slot.unsqueeze(-1).expand(C, L),
-
-        ships=cand_send,
-
-        eta=cand_eta,
-
-        valid=cand_active & cand_valid.unsqueeze(-1),
-
-        player_id=pid,
-
+        viable & clears_floor & (sizes >= float(config.min_ships_to_launch))
+        & src_neq_tgt & source_exists.view(S, 1) & target_exists.view(1, T)
     )
 
+    L = 1
+    C = S * T
+    cand_src = source_idx.view(S, 1).expand(S, T).reshape(C, L)
+    cand_tgt_slot = target_idx.view(1, T).expand(S, T).reshape(C)
+    cand_tgt_short = torch.arange(T, device=device).view(1, T).expand(S, T).reshape(C)
+    cand_send = torch.where(valid, sizes, torch.zeros_like(sizes)).reshape(C, L)
+    cand_angle = angle.reshape(C, L)
+    cand_eta = torch.where(valid, eta, torch.ones_like(eta)).reshape(C, L)
+    cand_active = valid.reshape(C, L)
+    cand_valid = valid.reshape(C)
+    cand_is_def = target_is_mine[cand_tgt_short]
+
+    launches = make_launch_set(
+        source_slots=cand_src,
+        target_slots=cand_tgt_slot.unsqueeze(-1).expand(C, L),
+        ships=cand_send,
+        eta=cand_eta,
+        valid=cand_active & cand_valid.unsqueeze(-1),
+        player_id=pid,
+    )
     score = score_candidates(
-
         garrison_status, prod=prod, alive_by_step=alive_by_step,
-
         player_count=int(player_count), launches=launches, player_id=pid,
+    )
 
-    )                                                                            # [C]
+    # Late-game suppression
+    score = _suppress_late_candidates(
+        score=score, obs=obs, target_idx=target_idx,
+        cand_tgt_short=cand_tgt_short, cand_is_def=cand_is_def,
+        cand_eta=cand_eta, step=int(step), player_id=pid,
+    )
 
     score = torch.where(cand_valid, score, torch.full_like(score, float("-inf")))
 
-
-
     wave_entries, leftover = _greedy_select(
-
         P=P, W=W, device=device, dtype=dtype, score=score,
-
         cand_src=cand_src, cand_send=cand_send, cand_angle=cand_angle, cand_eta=cand_eta,
-
         cand_active=cand_active, cand_tgt_slot=cand_tgt_slot, cand_tgt_short=cand_tgt_short,
-
         cand_is_def=cand_is_def, source_budget=obs.ships.to(dtype).clone(),
-
         target_exists=target_exists, roi_threshold=float(config.roi_threshold),
-
     )
-
-
 
     if not bool(config.enable_regroup):
-
         return wave_entries
 
-    enemy_mass = cheap_enemy_pressure(obs, cache, horizon=float(K_eta), player_id=pid)  # [P]
-
-    if bool(config.enable_potential_risk):
-
-        # Precautionary potential-attack threat (enemy planets, sun-LOS-gated,
-
-        # discounted by friendly support) biases the regroup to pre-strengthen the
-
-        # most exposed owned planets. Additive — risk_blend_weight=0 == original.
-
-        enemy_mass = enemy_mass + float(config.risk_blend_weight) * potential_attack_risk(
-
-            obs, cache, horizon=float(K_eta), player_id=pid, config=config,
-
-        )
-
     regroup_entries = _plan_regroup(
-
         movement=movement, obs=obs, obs_tensors=obs_tensors, garrison_status=garrison_status,
-
         leftover=leftover, original_ships=obs.ships.to(dtype), pressure=enemy_mass,
-
         config=config, H=H,
-
     )
-
     return concat_launch_entries([wave_entries, regroup_entries])
 
 
-
-
+# ---------------------------------------------------------------------------
+# Turn pipeline
+# ---------------------------------------------------------------------------
 
 def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int, memory) -> dict:
-
-    """Full per-turn pipeline: build movement → plan single-size waves + regroup → emit.
-
-
-
-    ``memory`` must expose a mutable ``movement`` attribute (the rolling cache).
-
-    """
-
     device = obs_tensors["planets"].device
-
     obs = parse_obs(obs_tensors)
-
     P = obs.P
-
     if P == 0:
-
         return empty_action_row(device)
 
-
-
     movement = ensure_planet_movement(
-
         obs_tensors=obs_tensors,
-
         expected_cfg=_movement_config(config, player_count=int(player_count)),
-
         cached_movement=getattr(memory, "movement", None),
-
     )
-
     memory.movement = movement
+    step = int(obs_tensors["step"].reshape(-1)[0].item())
+
+    # Dynamic adjustment: continuously tune ROI + waves based on game state
+    config = _adjust_config(
+        config, obs=obs, prod=movement.planet_prod, step=step, player_count=int(player_count)
+    )
 
     cache = build_distance_cache(movement, max_k=int(config.horizon))
-
     H = int(config.horizon)
-
     status = movement.garrison_status(max_horizon=H)
-
     alive_by_step = movement.alive_by_step[: H + 1]
 
-
-
     entries = plan_lite_waves(
-
         movement=movement, obs=obs, obs_tensors=obs_tensors, cache=cache,
-
         garrison_status=status, prod=movement.planet_prod,
-
         alive_by_step=alive_by_step, config=config, player_count=int(player_count),
-
     )
-
     entries = disambiguate_duplicate_launches(entries)
-
     launches = infer_planned_launches_from_entries(
-
         obs_tensors=obs_tensors, movement=movement, entries=entries, player_id=int(obs.player_id),
-
     )
-
     apply_private_planned_launches(
-
         movement=movement, launches=launches, owner_id=int(obs.player_id),
-
         obs_tensors=obs_tensors,
-
     )
-
     planet_ids = obs_tensors["planets"][..., 0].long()
-
     return entries_to_sparse_payload(entries, planet_ids=planet_ids)
 
 
+# ---------------------------------------------------------------------------
+# Mode presets
+# ---------------------------------------------------------------------------
 
+CONFIG_2P = ProducerLiteConfig()  # ROI=1.40, horizon=18, waves=6
 
-
-# 4P FFA preset — only the knobs that differ from the 2P default. 
-
-CONFIG_4P = dataclasses.replace(
-
+CONFIG_3P = replace(
     ProducerLiteConfig(),
+    horizon=15,
+    max_sources_per_lane=8,
+    max_offensive_targets=10,
+    max_defensive_targets=3,
+    roi_threshold=1.35,
+)
 
+CONFIG_4P = replace(
+    ProducerLiteConfig(),
     horizon=13,
-
-    max_sources_per_lane=6,
-
+    roi_threshold=1.25,
+    max_sources_per_lane=7,
     max_defensive_targets=2,
-
+    max_waves_per_turn=5,
     max_regroup_time=6.0,
-
     max_regroup_targets_per_source=8,
-
-    risk_blend_weight=0.5,                   # damp the precaution in diffuse 4p FFA
-
-    max_strike_sources=3,                    # leaner combined strikes in 4p FFA
-
 )
 
 
-
-
-
 def _config_for(player_count: int) -> ProducerLiteConfig:
+    pc = int(player_count)
+    if pc >= 4:
+        return CONFIG_4P
+    elif pc == 3:
+        return CONFIG_3P
+    return CONFIG_2P
 
-    return CONFIG_4P if int(player_count) >= 4 else ProducerLiteConfig()
 
-
-
-
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
 
 class ProducerLiteMemory:
-
     def __init__(self) -> None:
-
         self.movement = None
-
         self.cached_player_count: int | None = None
-
         self.last_sparse_action_row: dict | None = None
 
-
-
     def reset(self) -> None:
-
         self.movement = None
-
         self.cached_player_count = None
-
         self.last_sparse_action_row = None
 
 
-
-
-
 class ProducerLiteRuntime:
-
     def __init__(self, memory: ProducerLiteMemory | None = None) -> None:
-
         self.memory = memory if memory is not None else ProducerLiteMemory()
 
-
-
     def reset(self) -> None:
-
         self.memory.reset()
 
-
-
     def tensor_action(self, obs_tensors: dict):
-
         mem = self.memory
-
         if bool((obs_tensors["step"] == 0).all()):
-
             mem.cached_player_count = None
-
         if mem.cached_player_count is None:
-
             mem.cached_player_count = largest_initial_player_count(obs_tensors)
-
         config = _config_for(mem.cached_player_count)
-
         row = run_turn(
-
             obs_tensors, config=config,
-
             player_count=int(mem.cached_player_count), memory=mem,
-
         )
-
         mem.last_sparse_action_row = row
-
         return row
-
-
-
 
 
 _RUNTIME = ProducerLiteRuntime()
 
 
-
-
-
 # ---------------------------------------------------------------------------
-
 # Entry point
-
 # ---------------------------------------------------------------------------
-
-
 
 def agent(obs):
-
     """Single-observation entry point for local play and Kaggle."""
-
     player = obs.get("player", 0) if isinstance(obs, dict) else obs.player
-
     player_id = int(player)
-
     obs_tensors = single_obs_to_tensor(obs, player_id=player_id)
-
     with torch.no_grad():
-
         sparse_row = _RUNTIME.tensor_action(obs_tensors)
-
     return sparse_action_row_to_moves(sparse_row, obs, player_id=player_id)
-
-
