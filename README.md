@@ -1,8 +1,6 @@
 # Kaggle Orbit Wars
 
-This repository contains the final local workspace for the Kaggle **Orbit Wars**
-competition. The root `main.py` is the best-settled submitted agent kept as the
-default runnable entry point.
+This repository contains the final local workspace for the Kaggle [Orbit Wars](https://www.kaggle.com/competitions/orbit-wars/overview) competition. The root `main.py` is the best-settled submitted agent kept as the default runnable entry point.
 
 ## Final Status
 
