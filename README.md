@@ -77,3 +77,10 @@ Before pushing, this repository was cleaned to remove:
 - machine-specific paths and credential-like material.
 
 See [docs/security-audit.md](docs/security-audit.md) for the latest scan notes.
+
+## Licensing and provenance
+
+This repository intentionally has no repository-wide license yet. Some agents
+are derived from public Kaggle code, so redistribution terms must be verified
+for each upstream source before a license is selected. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the review boundary.
